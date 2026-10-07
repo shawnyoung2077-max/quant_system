@@ -42,10 +42,12 @@ def to_close_panel(ohlcv: pd.DataFrame, date_col: str = "date",
 
 def make_sample_prices(n_assets: int = 20, n_days: int = 1000,
                        seed: int = 42, drift: float = 0.0003,
-                       vol: float = 0.02) -> pd.DataFrame:
+                       vol: float = 0.02,
+                       signal: float = 0.0,
+                       signal_persistence: float = 0.97) -> pd.DataFrame:
     """
     生成示例价格：几何布朗运动，资产间通过共同因子产生相关性。
-    用于在没有真实数据时演示回测流程。
+    用于在没有真实数据时演示/测试回测流程。
 
     Parameters
     ----------
@@ -54,6 +56,20 @@ def make_sample_prices(n_assets: int = 20, n_days: int = 1000,
     seed     : 随机种子（可复现）
     drift    : 日漂移（年化约 drift*252）
     vol      : 日波动率
+    signal   : 植入信号的强度（0 = 纯随机游走，无任何可利用信号）
+    signal_persistence : 信号自相关（越高越"持续"，动量类策略越容易捕捉）
+
+    Notes
+    -----
+    ``signal > 0`` 时额外植入一个 **持续性的横截面 alpha**：
+    每只资产有一个缓慢变化的特质漂移（AR(1)），它同时影响当期收益，
+    因此「过去的相对强弱」可以预测「未来的相对强弱」——即存在真实动量。
+
+    这不是"作弊"：策略层只看得到价格序列，看不到 ``alpha`` 本身。
+    它的用途是**验证回测管线能否检测到已知存在的信号**——
+    如果连植入的信号都测不出来，说明管线有问题。
+
+    默认 ``signal=0.0``，保持纯随机游走，用于测试"无可利用信息时不应产生虚假 alpha"。
     """
     rng = np.random.default_rng(seed)
     dates = pd.bdate_range("2022-01-03", periods=n_days)
@@ -64,5 +80,17 @@ def make_sample_prices(n_assets: int = 20, n_days: int = 1000,
     factor_exposure = rng.uniform(0.5, 1.2, n_assets)
 
     returns = common[:, None] * factor_exposure[None, :] + idiosyncratic
+
+    if signal > 0:
+        # 持续性横截面 alpha：AR(1) 过程
+        alpha = np.zeros((n_days, n_assets))
+        alpha[0] = rng.normal(0.0, 1.0, n_assets)
+        for t in range(1, n_days):
+            alpha[t] = (signal_persistence * alpha[t - 1]
+                        + (1.0 - signal_persistence) * rng.normal(0.0, 1.0, n_assets))
+        # 标准化到单位波动，再按 signal 缩放
+        alpha = alpha / (alpha.std(axis=1, keepdims=True) + 1e-12)
+        returns = returns + signal * alpha * vol
+
     prices = 100.0 * np.exp(np.cumsum(returns, axis=0))
     return pd.DataFrame(prices, index=dates, columns=[f"A{i+1:02d}" for i in range(n_assets)])
