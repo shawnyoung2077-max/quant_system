@@ -1,0 +1,43 @@
+{
+  "config": {
+    "name": "size_factor_study",
+    "factor": "size",
+    "top": 0.2,
+    "period": 21,
+    "long_only": true,
+    "start": "2015-01-01",
+    "end": null,
+    "universe": null
+  },
+  "data": {
+    "stocks": 800,
+    "days": 2834,
+    "start": "2015-01-05",
+    "end": "2026-08-31"
+  },
+  "metrics": {
+    "annualized_return": 0.021678827070552315,
+    "sharpe": 0.11862375814414344,
+    "max_drawdown": 0.4700689380356494,
+    "total_return": 0.27277009553108966,
+    "turnover": 3.5793052339078084
+  },
+  "fm": {
+    "lambda": -0.009124931523848384,
+    "tstat": -7.95381951730464,
+    "p": 2.886579864025407e-15,
+    "significant": true
+  },
+  "ff_alpha": {
+    "alpha": -0.0002780888110711645,
+    "alpha_t": -1.9218315025787378,
+    "beta_mkt": 0.6908488533995762,
+    "r2": 0.5320079063862957,
+    "significant": false
+  },
+  "ic": {
+    "ic_mean": -0.051203952743635366,
+    "icir": -0.302170988849488
+  },
+  "run_at": "2026-09-01 11:20:24"
+}

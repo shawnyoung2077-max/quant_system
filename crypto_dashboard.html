@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>加密 Alpha Studio · Crypto</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root{--bg:#0b0f19;--bg2:#101624;--panel:#151c2c;--line:#243049;--line2:#1a2233;
+    --text:#e6eaf2;--muted:#8b94a8;--accent:#f0b90b;--good:#34d399;--bad:#f87171;}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--text);font-size:14px}
+  nav{display:flex;align-items:center;gap:24px;padding:0 28px;height:54px;background:var(--bg2);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10}
+  nav .logo{font-weight:800;font-size:17px}nav .logo span{color:var(--accent)}
+  nav a{color:var(--muted);text-decoration:none;font-size:13px}
+  nav a:hover{color:var(--text)} nav .spacer{flex:1}
+  nav .badge{font-size:12px;color:var(--muted);border:1px solid var(--line);padding:4px 12px;border-radius:20px}
+  main{max-width:1240px;margin:0 auto;padding:22px 28px 60px}
+  .layout{display:grid;grid-template-columns:320px 1fr;gap:18px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+  .panel h2{margin:0 0 14px;font-size:13px;letter-spacing:1px;color:var(--muted);text-transform:uppercase}
+  label{display:block;font-size:11px;color:var(--muted);margin:12px 0 5px}
+  select,input[type=number]{width:100%;padding:8px 10px;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:7px;font-size:14px}
+  .chk{display:flex;align-items:center;gap:8px;margin-top:14px;font-size:13px;color:var(--muted)}
+  .chk input{width:auto}
+  button{width:100%;padding:10px;margin-top:12px;border:none;border-radius:7px;font-size:14px;font-weight:700;cursor:pointer}
+  .btn-primary{background:var(--accent);color:#1a1400}
+  .btn-ghost{background:var(--bg);color:var(--text);border:1px solid var(--line)}
+  .status{margin-top:12px;font-size:12px;color:var(--muted);min-height:16px}
+  .metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+  .m{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+  .m .k{font-size:11px;color:var(--muted)} .m .v{font-size:19px;font-weight:700;margin-top:3px}
+  .grade{display:inline-block;min-width:34px;text-align:center;padding:3px 8px;border-radius:6px;font-weight:800}
+  .grade.A{background:#064e3b;color:#34d399}.grade.B{background:#365314;color:#a3e635}
+  .grade.C{background:#713f12;color:#fbbf24}.grade.D{background:#7c2d12;color:#fb923c}.grade.F{background:#450a0a;color:#f87171}
+  .table{width:100%;border-collapse:collapse;font-size:12.5px}
+  .table th{color:var(--muted);text-align:left;padding:8px;border-bottom:1px solid var(--line);font-size:11px}
+  .table td{padding:7px 8px;border-bottom:1px solid var(--line2)}
+  .good{color:var(--good)}.bad{color:var(--bad)}
+  canvas{width:100%}
+  .hint{font-size:12px;color:var(--muted);line-height:1.7;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin-top:12px}
+  .empty{color:var(--muted);text-align:center;padding:26px}
+  .plotbox{display:grid;grid-template-columns:1.7fr 1fr;gap:16px;margin-top:16px}
+</style></head>
+<body>
+<nav>
+  <div class="logo">加密<span>Alpha</span> Studio</div>
+  <a href="/">← A股平台</a>
+  <a href="#coinsec">币种数据</a>
+  <a href="#screensec">IC 筛选</a>
+  <div class="spacer"></div>
+  <div class="badge" id="dataBadge">加载中…</div>
+</nav>
+<main>
+  <div class="layout">
+    <div class="panel">
+      <h2>加密因子研究</h2>
+      <label>因子 Factor</label>
+      <select id="factor">
+        <option value="momentum">momentum 动量</option>
+        <option value="reversal">reversal 短期反转</option>
+        <option value="price_ma">price_ma 相对均线</option>
+        <option value="volatility">volatility 波动率</option>
+        <option value="volume">volume 成交量</option>
+      </select>
+      <label>Lookback 回看天数</label>
+      <input id="lookback" type="number" value="20">
+      <label>Top 前百分之多少（0.2=前20%）</label>
+      <input id="top" type="number" value="0.2" step="0.05">
+      <label>Hold 持有期（天）</label>
+      <input id="hold" type="number" value="1">
+      <div class="chk"><input id="longshort" type="checkbox" checked> 多空对冲（默认；加密建议开）</div>
+      <button class="btn-primary" onclick="runAll()">▶ 回测 &amp; 评分</button>
+      <button class="btn-ghost" onclick="screen()">🔍 IC 筛选</button>
+      <div class="status" id="status"></div>
+      <div class="hint">
+        <b>加密评分口径：</b>年化按 <b>365 天</b>（全年无休），Fitness 分母用<b>日换手</b>（与 BRAIN 一致）。
+        加密行情高度同涨同跌，<b>建议开多空对冲</b>，否则收益基本是 beta。
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>当前因子 · 回测与评分</h2>
+      <div class="metrics" id="metrics"><div class="empty">点左侧「回测 &amp; 评分」开始</div></div>
+      <div class="plotbox">
+        <div><div style="font-size:12px;color:var(--muted);margin-bottom:6px">净值曲线（策略 vs 基准）</div><canvas id="eqChart"></canvas></div>
+        <div><div style="font-size:12px;color:var(--muted);margin-bottom:6px">回撤</div><img id="ddImg" style="display:none;width:100%"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:18px" id="coinsec">
+    <h2>🪙 币种数据（Binance 全量历史已落盘）</h2>
+    <div id="coinTable"></div>
+  </div>
+
+  <div class="panel" style="margin-top:18px" id="screensec">
+    <h2>🔍 IC 初筛（先找真信号）</h2>
+    <div id="screenBox"></div>
+  </div>
+
+  <div class="panel" style="margin-top:18px">
+    <h2>候选记录（加密）</h2>
+    <table class="table" id="poolTable"><tbody><tr><td class="empty">加载中…</td></tr></tbody></table>
+  </div>
+</main>
+<script>
+let chart=null;
+function fmt(x,d=2){return (x==null||!isFinite(x))?'—':Number(x).toFixed(d)}
+function pct(x){return (x==null||!isFinite(x))?'—':(x*100).toFixed(2)+'%'}
+async function post(u,b){return (await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})).json()}
+function params(){return {factor:document.getElementById('factor').value,
+  lookback:parseInt(document.getElementById('lookback').value),
+  top:parseFloat(document.getElementById('top').value),
+  hold:parseInt(document.getElementById('hold').value),
+  long_short:document.getElementById('longshort').checked}}
+
+async function init(){
+  const r=await (await fetch('/api/crypto/meta')).json();
+  if(!r.ok){document.getElementById('dataBadge').textContent='无数据';return;}
+  const p=r.panel||{};
+  document.getElementById('dataBadge').textContent=`${r.n_coins} 币 × ${p.rows||0} 天 (${p.start||''}~${p.end||''})`;
+  let h='<table class="table"><thead><tr><th>交易对</th><th>行数</th><th>起始</th><th>结束</th></tr></thead>';
+  for(const c of (r.coins||[])){
+    h+=`<tr><td><b>${c.code}</b></td><td>${c.rows}</td><td>${c.start}</td><td>${c.end}</td></tr>`;
+  }
+  h+='</table>';
+  document.getElementById('coinTable').innerHTML=h;
+  loadPool();
+}
+async function runAll(){
+  const st=document.getElementById('status'); st.textContent='回测&评分中…';
+  const r=await post('/api/crypto/run',params());
+  if(!r.ok){st.textContent='错误:'+r.error;return;}
+  st.textContent='完成 ✓';
+  const s=r.wq_score;
+  document.getElementById('metrics').innerHTML=`
+    <div class="m"><div class="k">等级 Grade</div><div class="v"><span class="grade ${s.grade}">${s.grade}</span></div></div>
+    <div class="m"><div class="k">Sharpe</div><div class="v">${fmt(s.sharpe)}</div></div>
+    <div class="m"><div class="k">Fitness</div><div class="v">${fmt(s.fitness,3)}</div></div>
+    <div class="m"><div class="k">年化收益</div><div class="v">${pct(s.returns)}</div></div>
+    <div class="m"><div class="k">换手(日)</div><div class="v">${fmt(s.turnover,3)}</div></div>
+    <div class="m"><div class="k">最大回撤</div><div class="v">${pct(s.drawdown)}</div></div>
+    <div class="m"><div class="k">Margin</div><div class="v">${fmt(s.margin,3)}</div></div>
+    <div class="m"><div class="k">基准年化</div><div class="v">${pct(r.bench_ann)}</div></div>`;
+  const eq=r.equity;
+  if(chart)chart.destroy();
+  try{ chart=new Chart(document.getElementById('eqChart'),{type:'line',data:{labels:eq.dates,datasets:[
+    {label:'策略',data:eq.strategy,borderColor:'#f0b90b',borderWidth:1.6,pointRadius:0},
+    {label:'基准(等权持有)',data:eq.benchmark,borderColor:'#f87171',borderWidth:1.2,pointRadius:0}]},
+    options:{plugins:{legend:{labels:{color:'#e6eaf2',font:{size:11}}}},scales:{x:{ticks:{color:'#8b94a8',maxTicksLimit:8,font:{size:10}}},y:{ticks:{color:'#8b94a8',font:{size:10}}}},interaction:{mode:'index',intersect:false}}});}catch(e){}
+  document.getElementById('ddImg').style.display='block';
+  document.getElementById('ddImg').src=r.dd_plot_url||'';
+  await post('/api/crypto/pool_add',{name:r.name,factor:params().factor,lookback:params().lookback,
+    expression:r.name,grade:s.grade,good:s.good,sharpe:s.sharpe,fitness:s.fitness,
+    returns:s.returns,turnover:s.turnover,subU:0,ic:0});
+  loadPool();
+}
+async function screen(){
+  const st=document.getElementById('status'); st.textContent='IC 筛选中…';
+  const box=document.getElementById('screenBox'); box.innerHTML='<div style="color:var(--muted)">计算中…</div>';
+  const r=await post('/api/crypto/screen',{periods:[1,5,20,60]});
+  if(!r.ok){st.textContent='错误:'+(r.error||'');box.innerHTML='';return;}
+  st.textContent='IC 完成 ✓';
+  let h='<table class="table"><thead><tr><th>因子</th><th>周期</th><th>IC</th><th>ICIR</th><th>建议</th></tr></thead>';
+  for(const x of r.rows){
+    const note=Math.abs(x.IC)>0.03?'<span class="good">有信号·值得挖</span>':Math.abs(x.IC)>0.02?'<span style="color:#fbbf24">一般</span>':'<span class="bad">弱</span>';
+    h+=`<tr><td>${x.factor}</td><td>${x.period}</td><td>${x.IC}</td><td>${x.ICIR}</td><td>${note}</td></tr>`;
+  }
+  box.innerHTML=h+'</table>';
+}
+async function loadPool(){
+  const r=await (await fetch('/api/pool_list')).json(); if(!r.ok)return;
+  const tb=document.getElementById('poolTable');
+  const rows=(r.rows||[]).filter(x=>String(x.name||'').startsWith('crypto'));
+  if(!rows.length){tb.innerHTML='<tr><td class="empty">（暂无加密记录）</td></tr>';return;}
+  let h='<thead><tr><th>名称</th><th>等级</th><th>Sharpe</th><th>Fitness</th><th>Good</th><th>日期</th></tr></thead>';
+  for(const x of rows){
+    h+=`<tr><td>${x.name}</td><td><span class="grade ${x.grade}">${x.grade}</span></td>
+      <td>${fmt(x.sharpe)}</td><td>${fmt(x.fitness,3)}</td>
+      <td class="${x.good?'good':'bad'}">${x.good?'✓':'✗'}</td><td>${x.created||''}</td></tr>`;
+  }
+  tb.innerHTML=h;
+}
+init();
+</script>
+</body></html>

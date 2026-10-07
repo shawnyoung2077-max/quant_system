@@ -1,0 +1,21 @@
+# quant_system 依赖
+# 安装: pip install -r requirements.txt
+
+# --- 数据处理 ---
+numpy
+pandas
+
+# --- 网络与数据源 ---
+requests
+ccxt
+akshare
+
+# --- 可视化 ---
+matplotlib
+
+# --- 机器学习 ---
+scipy
+
+# --- Web / 其他 ---
+flask
+tqdm

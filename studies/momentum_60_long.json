@@ -1,0 +1,44 @@
+{
+  "config": {
+    "name": "momentum_60_long",
+    "factor": "momentum",
+    "lookback": 60,
+    "top": 0.2,
+    "period": 5,
+    "long_only": true,
+    "start": "2015-01-01",
+    "end": null,
+    "universe": null
+  },
+  "data": {
+    "stocks": 800,
+    "days": 2834,
+    "start": "2015-01-05",
+    "end": "2026-08-31"
+  },
+  "metrics": {
+    "annualized_return": 0.015951805251028434,
+    "sharpe": 0.05648242131923891,
+    "max_drawdown": 0.7140888014793392,
+    "total_return": 0.19479988561664174,
+    "turnover": 50.560758142879166
+  },
+  "fm": {
+    "lambda": -0.0004003232881930888,
+    "tstat": -0.8505332908587261,
+    "p": 0.3951022250861156,
+    "significant": false
+  },
+  "ff_alpha": {
+    "alpha": -0.0005681063804545844,
+    "alpha_t": -3.1476264059797137,
+    "beta_mkt": 1.269389687419002,
+    "r2": 0.7521025730597426,
+    "significant": true
+  },
+  "ic": {
+    "ic_mean": -0.029348886428762797,
+    "icir": -0.1461682151481166
+  },
+  "run_at": "2026-09-01 11:09:40"
+}

@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>量化回测平台 · Alpha Studio</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root{
+    --bg:#0b0f19; --bg2:#101624; --panel:#151c2c; --line:#243049; --line2:#1a2233;
+    --text:#e6eaf2; --muted:#8b94a8; --accent:#4ea8ff; --accent2:#2b6cb0;
+    --good:#34d399; --warn:#fbbf24; --bad:#f87171;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:"Segoe UI",system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);font-size:14px}
+  /* 顶部导航 */
+  nav{display:flex;align-items:center;gap:26px;padding:0 28px;height:54px;background:var(--bg2);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10}
+  nav .logo{font-weight:800;font-size:17px;letter-spacing:.5px}
+  nav .logo span{color:var(--accent)}
+  nav .navlink{color:var(--muted);cursor:pointer;font-size:13px;padding:6px 2px;border-bottom:2px solid transparent}
+  nav .navlink.active{color:var(--text);border-color:var(--accent)}
+  nav .spacer{flex:1}
+  nav .databadge{font-size:12px;color:var(--muted);border:1px solid var(--line);padding:4px 12px;border-radius:20px}
+  main{max-width:1240px;margin:0 auto;padding:22px 28px 60px}
+  .layout{display:grid;grid-template-columns:320px 1fr;gap:18px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+  .panel h2{margin:0 0 14px;font-size:13px;letter-spacing:1px;color:var(--muted);font-weight:600;text-transform:uppercase}
+  label{display:block;font-size:11px;color:var(--muted);margin:12px 0 5px;letter-spacing:.3px}
+  select,input[type=number]{width:100%;padding:8px 10px;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:7px;font-size:14px}
+  .chk{display:flex;align-items:center;gap:8px;margin-top:14px;font-size:13px;color:var(--muted)}
+  .chk input{width:auto}
+  button{width:100%;padding:10px;margin-top:12px;border:none;border-radius:7px;font-size:14px;font-weight:700;cursor:pointer}
+  .btn-primary{background:var(--accent);color:#06121f}
+  .btn-ghost{background:var(--bg);color:var(--text);border:1px solid var(--line)}
+  .btn-green{background:var(--good);color:#052012}
+  .btn-sm{width:auto;padding:4px 10px;font-size:12px;font-weight:600;margin:0}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  .status{margin-top:12px;font-size:12px;color:var(--muted);min-height:16px}
+  /* 指标行 */
+  .metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+  .m{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+  .m .k{font-size:11px;color:var(--muted)} .m .v{font-size:19px;font-weight:700;margin-top:3px}
+  /* 等级徽章 */
+  .grade{display:inline-block;min-width:34px;text-align:center;padding:3px 8px;border-radius:6px;font-weight:800;font-size:14px}
+  .grade.A{background:#064e3b;color:#34d399}.grade.B{background:#365314;color:#a3e635}
+  .grade.C{background:#713f12;color:#fbbf24}.grade.D{background:#7c2d12;color:#fb923c}.grade.F{background:#450a0a;color:#f87171}
+  /* 表格 */
+  .table{width:100%;border-collapse:collapse;font-size:12.5px}
+  .table th{color:var(--muted);font-weight:600;text-align:left;padding:8px;border-bottom:1px solid var(--line);font-size:11px;letter-spacing:.3px}
+  .table td{padding:7px 8px;border-bottom:1px solid var(--line2);vertical-align:middle}
+  .table tr:hover{background:#0d1424}
+  .good{color:var(--good)} .bad{color:var(--bad)}
+  .plotbox{display:grid;grid-template-columns:1.6fr 1fr;gap:16px;margin-top:16px}
+  .plotbox img,.plotbox canvas{width:100%;border-radius:8px}
+  .hint{font-size:12px;color:var(--muted);line-height:1.7;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin-top:12px}
+  .hint b{color:var(--accent)}
+  .empty{color:var(--muted);text-align:center;padding:26px}
+</style>
+</head>
+<body>
+<nav>
+  <div class="logo">量化<span>Alpha</span> Studio</div>
+  <div class="navlink active">因子研究</div>
+  <div class="navlink" onclick="document.getElementById('libsec').scrollIntoView({behavior:'smooth'})">Alpha 库</div>
+  <div class="navlink" onclick="document.getElementById('designsec').scrollIntoView({behavior:'smooth'})">回测设计</div>
+  <div class="spacer"></div>
+  <div class="databadge" id="dataBadge">加载中…</div>
+  <div class="databadge" id="ver" style="margin-left:6px;color:#34d399;border-color:#34d399">v2.0</div>
+</nav>
+<main>
+  <div class="layout">
+    <div class="panel">
+      <h2>因子研究</h2>
+      <label>因子 Factor</label>
+      <select id="factor"></select>
+      <label>Lookback 回看天数</label>
+      <input id="lookback" type="number" value="60">
+      <label>Top 前百分之多少（0.2=前20%）</label>
+      <input id="top" type="number" value="0.2" step="0.05">
+      <label>预测期 period（天）</label>
+      <input id="period" type="number" value="5">
+      <div class="chk"><input id="longshort" type="checkbox"> 多空对冲（默认纯多头）</div>
+      <button class="btn-primary" onclick="runAll()">▶ 回测 &amp; 评分</button>
+      <button class="btn-ghost" onclick="runMine()">IC 挖alpha</button>
+      <div class="status" id="status"></div>
+    </div>
+
+    <div class="panel">
+      <h2>当前因子 · 回测与评分</h2>
+      <div class="metrics" id="metrics"></div>
+      <div id="sigline"></div>
+      <div class="plotbox">
+        <div><div style="font-size:12px;color:var(--muted);margin-bottom:6px">净值曲线 vs 基准（策略蓝 / 基准红）</div><canvas id="eqChart"></canvas></div>
+        <div><div style="font-size:12px;color:var(--muted);margin-bottom:6px">回撤曲线</div><img id="ddImg" style="display:none"></div>
+      </div>
+      <button class="btn-ghost" onclick="icScreen()" style="margin-top:14px">🔍 因子 IC 筛选（哪个值得挖）</button>
+      <div id="icScreenBox" style="margin-top:10px"></div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:18px">
+    <h2>✍️ 自定义因子（自己写代码跑回测）</h2>
+    <div style="font-size:12px;color:var(--muted);margin-bottom:8px">
+      在下面写一个 <b>factor(prices)</b> 函数（prices 是"日期×股票"价格表），返回"日期×股票"的因子值。
+      可用算子库 <b>F</b>：F.momentum / F.zscore / F.rank / F.ts_mean / F.ts_delta / F.ts_std /
+      F.short_term_reversal / F.price_vs_ma / F.volatility_factor / F.combine。也可直接返回目标权重 weights(prices)。
+    </div>
+    <textarea id="codeEditor" rows="6" style="width:100%;background:#0b0f19;color:#c9e2ff;border:1px solid var(--line);border-radius:8px;font-family:Consolas,monospace;font-size:13px;padding:12px">import factor as F
+
+def factor(prices):
+    # 例：20日动量 + 60日反转 组合（自动做横截面z-score）
+    return F.zscore(F.momentum(prices, 20) - F.momentum(prices, 60))</textarea>
+    <div style="display:flex;gap:10px;align-items:center;margin-top:10px">
+      <button class="btn-primary" onclick="runCustom()" style="width:200px;margin-top:0">▶ 运行我的代码</button>
+      <button class="btn-ghost" onclick="document.getElementById('codeEditor').value='import factor as F\n\ndef factor(prices):\n    return F.zscore(F.momentum(prices, 20))'" style="width:140px;margin-top:0">恢复示例</button>
+      <span style="font-size:12px;color:var(--muted)">参数沿用左侧面板的 Top / period / 做空</span>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:18px">
+    <h2>候选 Alphas（会话内测试记录）</h2>
+    <table class="table" id="alphaTable">
+      <thead><tr>
+        <th>因子</th><th>等级</th><th>Sharpe</th><th>Fitness</th><th>Returns</th>
+        <th>Turnover</th><th>Drawdown</th><th>Margin</th><th>权重集中</th><th>IC</th><th>Good</th><th></th>
+      </tr></thead>
+      <tbody id="alphaBody"><tr><td colspan="12" class="empty">还没有测试记录，点击"回测 &amp; 评分"添加</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="panel" style="margin-top:18px" id="libsec">
+    <h2>Alpha 库（质量门槛入库）</h2>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+      <div style="flex:0 0 140px"><label>入库门槛</label><select id="mingrade">
+        <option>A</option><option selected>B</option><option>C</option><option>D</option><option>F</option></select></div>
+      <div style="flex:1;min-width:180px"><label>命名(可选)</label><input id="libname" placeholder="如 my_alpha"></div>
+      <div><label>&nbsp;</label><button class="btn-green" onclick="saveToLib()" style="width:160px">存当前因子到库</button></div>
+      <div><label>&nbsp;</label><button class="btn-ghost" onclick="clearLib()" style="width:100px">清空库</button></div>
+    </div>
+    <table class="table" id="libTable" style="margin-top:14px"></table>
+  </div>
+
+  <div class="panel" style="margin-top:18px" id="designsec">
+    <h2>回测是怎么设计的</h2>
+    <div class="hint">
+      <b>① 数据：</b>用"日期 × 股票"的价格表（真实 A股 800 只 × 10 年，前复权）。<br>
+      <b>② 因子：</b>用算子对价格算一个每天的值，如动量 = 过去 lookback 日收益率。因子值越高代表"预测会涨"。<br>
+      <b>③ 信号→权重：</b>每天把所有股票按因子值排序，取前 top% 等权买入（纯多头）；可勾选做空则同时做空后 top%。<br>
+      <b>④ 向量化回测（防前视）：</b>组合当日收益 = <i>昨日权重 × 今日各股收益</i>（用 shift，绝不偷看当天收盘价）；<br>
+      &nbsp;&nbsp;&nbsp;权重会漂移：w<sub>t</sub> = w<sub>t-1</sub>×(1+r)/(1+组合收益)；换手 = |目标权重 − 漂移权重|；<br>
+      &nbsp;&nbsp;&nbsp;成本 = 换手 × (佣金+滑点)/10000；净收益 = 毛收益 − 成本。<br>
+      <b>⑤ 指标：</b>年化收益/波动、Sharpe、最大回撤、Calmar、胜率。<br>
+      <b>⑥ WorldQuant 评分：</b>Fitness = Sharpe×√|年化收益| / max(1,<b>日换手</b>)；按 Fitness+Sharpe 分 A/B/C/D/F，换手越高质量越低。<br>
+      <b>⑦ 存库门槛：</b>只有等级 ≥ 门槛（默认 B）才写进数据库，不达标直接丢弃。
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:18px" id="poolsec">
+    <h2>🎯 候选 Alpha 池（BRAIN 标准 · 持久）</h2>
+    <div style="font-size:12px;color:var(--muted);margin-bottom:10px">
+      每个你测过的因子自动记录在这里（不丢）。达标 = <b>Sharpe≥1.25 且 Fitness≥1.0</b>（= 可提交 GOOD）。达标可存库，未达标丢弃。
+    </div>
+    <table class="table" id="poolTable"><tbody><tr><td class="empty">加载中…</td></tr></tbody></table>
+  </div>
+
+  <div class="panel" style="margin-top:18px">
+    <h2>📊 中国市场数据类别（akshare 确认 · 接入状态）</h2>
+    <div id="datacatsBox" style="margin-top:8px"></div>
+    <div style="display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap">
+      <button class="btn-ghost" onclick="loadAnalyst()" style="width:200px;margin-top:0">分析师一致预期 Top100</button>
+      <span style="font-size:12px;color:var(--muted)">东财业绩预测截面：覆盖广度 / 买入评级 / 前瞻EPS</span>
+    </div>
+    <div id="analystBox" style="margin-top:10px;max-height:300px;overflow:auto"></div>
+    <div style="display:flex;gap:10px;align-items:center;margin-top:14px;flex-wrap:wrap">
+      <button class="btn-ghost" onclick="loadNews(false)" style="width:160px;margin-top:0">个股新闻情绪</button>
+      <button class="btn-primary" onclick="loadNews(true)" style="width:160px;margin-top:0">🔄 重新抓新闻</button>
+      <span style="font-size:12px;color:var(--muted)">东财近闻 + 词典启发式情绪(粗筛)</span>
+    </div>
+    <div id="newsBox" style="margin-top:10px;max-height:320px;overflow:auto"></div>
+  </div>
+
+</main>
+
+<script>
+let chart=null; const tested=[];
+window.onerror=function(msg,src,line){const st=document.getElementById('status');if(st){st.textContent='JS错误: '+msg+' (行'+line+')，请Ctrl+F5刷新';}return false;};
+const G={factor:null,lookback:60,top:0.2,period:5,long_short:false};
+function fmt(x,d=2){return (x==null||!isFinite(x))?'—':Number(x).toFixed(d)}
+function pct(x){return (x==null||!isFinite(x))?'—':(x*100).toFixed(2)+'%'}
+function params(){G.factor=document.getElementById('factor').value;
+  G.lookback=parseInt(document.getElementById('lookback').value);
+  G.top=parseFloat(document.getElementById('top').value);
+  G.period=parseInt(document.getElementById('period').value);
+  G.long_short=document.getElementById('longshort').checked; return {...G};}
+async function post(url,body){return (await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json()}
+
+async function init(){const r=await (await fetch('/api/data')).json();
+  document.getElementById('dataBadge').textContent=`${r.cols} 只 × ${r.rows} 天 (${r.start}~${r.end})`;
+  const sel=document.getElementById('factor'); r.factors.forEach(f=>{const o=document.createElement('option');o.value=f;o.textContent=f;sel.appendChild(o)});}
+
+async function runAll(){const st=document.getElementById('status');st.textContent='回测&评分中…';
+  const r=await post('/api/run',params()); if(!r.ok){st.textContent='错误:'+r.error;return;}
+  st.textContent='完成 ✓'; renderResult(r);
+  loadSignificance({factor:G.factor,lookback:G.lookback});
+  const s=r.wq_score;
+  const name=`${G.factor}_${G.lookback}${G.long_short?'_ls':''}`;
+  tested.unshift({name,grade:s.grade,sharpe:s.sharpe,fitness:s.fitness,ret:s.returns,turn:s.turnover,
+    dd:s.drawdown,margin:s.margin,conc:s.weight_concentration,ic:r.ic.ic_mean,good:s.good,params:{...G}});
+  renderAlphas();
+  recordPool(name, s, {factor:G.factor, lookback:G.lookback});
+}
+function renderResult(r){
+  const m=r.metrics, s=r.wq_score;
+  document.getElementById('metrics').innerHTML= s?`
+    <div class="m"><div class="k">等级 Grade</div><div class="v"><span class="grade ${s.grade}">${s.grade}</span></div></div>
+    <div class="m"><div class="k">Sharpe</div><div class="v">${fmt(s.sharpe)}</div></div>
+    <div class="m"><div class="k">Fitness</div><div class="v">${fmt(s.fitness,3)}</div></div>
+    <div class="m"><div class="k">年化收益</div><div class="v">${pct(s.returns)}</div></div>
+    <div class="m"><div class="k">换手(日,BRAIN口径)</div><div class="v">${fmt(s.turnover,3)}</div></div>
+    <div class="m"><div class="k">最大回撤</div><div class="v">${pct(s.drawdown)}</div></div>
+    <div class="m"><div class="k">Margin</div><div class="v">${fmt(s.margin,3)}</div></div>
+    <div class="m"><div class="k">权重集中度</div><div class="v">${fmt(s.weight_concentration,3)}</div></div>`
+  :`
+    <div class="m"><div class="k">总收益</div><div class="v">${pct(m.total_return)}</div></div>
+    <div class="m"><div class="k">年化收益</div><div class="v">${pct(m.annualized_return)}</div></div>
+    <div class="m"><div class="k">年化波动</div><div class="v">${pct(m.annualized_vol)}</div></div>
+    <div class="m"><div class="k">Sharpe</div><div class="v">${fmt(m.sharpe)}</div></div>
+    <div class="m"><div class="k">最大回撤</div><div class="v">${pct(m.max_drawdown)}</div></div>
+    <div class="m"><div class="k">Calmar</div><div class="v">${fmt(m.calmar)}</div></div>
+    <div class="m"><div class="k">胜率</div><div class="v">${pct(m.win_rate)}</div></div>
+    <div class="m"><div class="k">基准年化</div><div class="v">${pct(m.bench_annualized)}</div></div>`;
+  document.getElementById('ddImg').style.display='block';
+  document.getElementById('ddImg').src=r.dd_plot_url||'';
+  const eq=r.equity; if(chart)chart.destroy();
+  try{ chart=new Chart(document.getElementById('eqChart'),{type:'line',data:{labels:eq.dates,datasets:[
+    {label:'策略',data:eq.strategy,borderColor:'#4ea8ff',borderWidth:1.6,pointRadius:0,fill:false},
+    {label:'基准',data:eq.benchmark,borderColor:'#f87171',borderWidth:1.2,pointRadius:0,fill:false}]},
+    options:{plugins:{legend:{labels:{color:'#e6eaf2',font:{size:11}}}},scales:{x:{ticks:{color:'#8b94a8',maxTicksLimit:8,font:{size:10}}},y:{ticks:{color:'#8b94a8',font:{size:10}}}},interaction:{mode:'index',intersect:false}}}); }catch(e){}
+}
+async function loadSignificance(spec){
+  const el=document.getElementById('sigline');
+  if(el){ el.innerHTML='<div style="font-size:12px;color:var(--muted);padding:6px 12px">显著性计算中…</div>'; }
+  const body={...spec, top:G.top, period:G.period, long_short:G.long_short};
+  try{
+    const r=await post('/api/significance',body);
+    if(!r.ok||!r.fm){ if(el) el.innerHTML=''; return; }
+    const fm=r.fm, al=r.ff_alpha||{};
+    el.innerHTML=`<div style="font-size:12px;color:var(--muted);margin-top:10px;padding:8px 12px;background:var(--bg);border:1px solid var(--line);border-radius:8px">
+      Fama-MacBeth t=<b>${fmt(fm.tstat,2)}</b> (p=${fmt(fm.p,4)}) ${fm.significant?'<span class="good">显著</span>':'<span class="bad">不显著</span>'}
+      &nbsp;·&nbsp; FF alpha t=<b>${fmt(al.alpha_t,2)}</b> ${al.significant?'<span class="good">显著</span>':'<span class="bad">不显著</span>'}
+      &nbsp;·&nbsp; β=${fmt(al.beta_mkt,2)}</div>`;
+  }catch(e){ if(el) el.innerHTML=''; }
+}
+async function runCustom(){const st=document.getElementById('status');st.textContent='运行你的代码…';
+  try{
+    const body={code:document.getElementById('codeEditor').value,top:G.top,period:G.period,long_short:G.long_short};
+    const r=await post('/api/run_custom',body);
+    if(!r.ok){st.textContent='错误:'+r.error;return;}
+    st.textContent='自定义因子运行完成 ✓'; renderResult(r);
+    const ed=document.getElementById('codeEditor');
+    loadSignificance({code:ed.value});
+    const s=r.wq_score||{grade:'?',sharpe:r.metrics.sharpe,fitness:0,returns:r.metrics.annualized_return,turnover:0,drawdown:r.metrics.max_drawdown,margin:0,weight_concentration:0};
+    tested.unshift({name:'custom',grade:s.grade,sharpe:s.sharpe,fitness:s.fitness,ret:s.returns,
+      turn:s.turnover,dd:s.drawdown,margin:s.margin,conc:s.weight_concentration,ic:r.ic.ic_mean,
+      good:s.good,custom:true,code:document.getElementById('codeEditor').value,
+      params:{top:G.top,period:G.period,long_short:G.long_short}});
+    renderAlphas();
+    recordPool('custom', s, {is_custom:true, code:document.getElementById('codeEditor').value});
+  }catch(e){ st.textContent='出错: '+e.message+'（请按Ctrl+F5刷新页面后重试）'; }
+}
+function renderAlphas(){
+  const body=document.getElementById('alphaBody');
+  if(!tested.length){body.innerHTML='<tr><td colspan="12" class="empty">还没有测试记录</td></tr>';return;}
+  body.innerHTML=tested.map((a,i)=>`<tr>
+    <td><b>${a.name}</b></td>
+    <td><span class="grade ${a.grade}">${a.grade}</span></td>
+    <td>${fmt(a.sharpe)}</td><td>${fmt(a.fitness,3)}</td><td>${pct(a.ret)}</td>
+    <td>${fmt(a.turn,1)}×</td><td>${pct(a.dd)}</td><td>${fmt(a.margin,3)}</td>
+    <td>${fmt(a.conc,3)}</td><td>${fmt(a.ic,4)}</td>
+    <td class="${a.good?'good':'bad'}">${a.good?'✓':'✗'}</td>
+    <td><button class="btn-green btn-sm" onclick="saveRow(${i})">存库</button></td></tr>`).join('');
+}
+async function saveRow(i){const a=tested[i];
+  const min_grade=document.getElementById('mingrade').value;
+  const r= a.custom
+    ? await post('/api/libsave_custom',{code:a.code,min_grade,name:a.name,top:a.params.top,period:a.params.period,long_short:a.params.long_short})
+    : await post('/api/libsave',{...a.params,min_grade,name:a.name});
+  document.getElementById('status').textContent=r.saved?`已入库 id=${r.id}（等级${r.grade}）`:`未入库：${r.reason}`;
+  loadLib();}
+async function runMine(){const st=document.getElementById('status');st.textContent='挖alpha中…';
+  const r=await post('/api/run',params()); if(!r.ok){st.textContent='错误:'+r.error;return;}
+  document.getElementById('metrics').innerHTML=`
+    <div class="m"><div class="k">IC 均值</div><div class="v">${fmt(r.ic.ic_mean,4)}</div></div>
+    <div class="m"><div class="k">ICIR</div><div class="v">${fmt(r.ic.icir,4)}</div></div>
+    <div class="m"><div class="k">Sharpe(策略)</div><div class="v">${fmt(r.metrics.sharpe)}</div></div>
+    <div class="m"><div class="k">年化(策略)</div><div class="v">${pct(r.metrics.annualized_return)}</div></div>`;
+  st.textContent='IC 完成 ✓ (IC>0.03 且 ICIR>0.3 较好)';}
+async function saveToLib(){const body={...params(),min_grade:document.getElementById('mingrade').value,
+    name:document.getElementById('libname').value||`${G.factor}_${G.lookback}`};
+  const r=await post('/api/libsave',body);
+  document.getElementById('status').textContent=r.saved?`已入库 id=${r.id}（等级${r.grade}）`:`未入库：${r.reason}`; loadLib();}
+async function loadLib(){const r=await (await fetch('/api/liblist')).json(); if(!r.ok)return;
+  const tb=document.getElementById('libTable');
+  if(!r.rows.length){tb.innerHTML='<tr><td class="empty">（库为空）</td></tr>';return;}
+  let h='<thead><tr><th>id</th><th>等级</th><th>Good</th><th>Sharpe</th><th>Fitness</th><th>年化</th><th>换手</th><th>因子</th><th></th></tr></thead>';
+  for(const x of r.rows){
+    const gd=x.good?'是':'否'; const cls=x.good?'good':'bad';
+    h+='<tr><td>'+x.id+'</td><td><span class="grade '+x.grade+'">'+x.grade+'</span></td>'
+      +'<td class="'+cls+'">'+gd+'</td><td>'+fmt(x.sharpe)+'</td><td>'+fmt(x.fitness,3)+'</td>'
+      +'<td>'+pct(x.returns)+'</td><td>'+fmt(x.turnover,1)+'×</td>'
+      +'<td>'+(x.name||x.factor+'_'+x.lookback)+'</td>'
+      +'<td><button class="btn-ghost btn-sm" onclick="rmLib('+x.id+')">删</button></td></tr>';
+  }
+  tb.innerHTML=h;}
+async function icScreen(){
+  const st=document.getElementById('status'); st.textContent='IC 筛选中…（800只×10年，需等一会）';
+  const box=document.getElementById('icScreenBox'); box.innerHTML='<div style="color:var(--muted)">计算中…</div>';
+  const r=await post('/api/ic_screen',{periods:[5,21]});
+  if(!r.ok){st.textContent='错误:'+(r.error||'');return;}
+  st.textContent='IC 筛选完成 ✓';
+  // 每个因子最佳period
+  const best={};
+  for(const row of r.rows){
+    const k=row.factor;
+    if(!best[k] || Math.abs(row.IC)>Math.abs(best[k].IC)) best[k]=row;
+  }
+  const list=Object.values(best).sort((a,b)=>Math.abs(b.IC)-Math.abs(a.IC));
+  let h='<table class="table"><thead><tr><th>因子</th><th>周期</th><th>IC</th><th>ICIR</th><th>建议</th></tr></thead>';
+  for(const x of list){
+    const note=Math.abs(x.IC)>0.03?'<span class="good">有信号·值得挖</span>':Math.abs(x.IC)>0.02?'<span style="color:#fbbf24">一般</span>':'<span class="bad">弱/弃</span>';
+    h+='<tr><td>'+x.factor+'</td><td>'+x.period+'</td><td>'+x.IC+'</td><td>'+x.ICIR+'</td><td>'+note+'</td></tr>';
+  }
+  h+='</table><div style="font-size:12px;color:var(--muted);margin-top:6px">IC=因子与未来收益横截面相关，|IC|>0.03 值得深挖</div>';
+  box.innerHTML=h;
+}
+async function rmLib(id){await post('/api/librm',{id});loadLib();}
+async function clearLib(){await post('/api/libclear',{});loadLib();}
+async function recordPool(name, s, meta){
+  await post('/api/pool_add',{name, factor:meta.factor||null, lookback:meta.lookback||null,
+    expression:meta.code||name, is_custom:meta.is_custom||false,
+    grade:s.grade, good:s.good, sharpe:s.sharpe, fitness:s.fitness,
+    returns:s.returns, turnover:s.turnover, subU:0, ic:0});
+  loadPool();
+}
+async function loadPool(){
+  const r=await (await fetch('/api/pool_list')).json(); if(!r.ok)return;
+  const tb=document.getElementById('poolTable');
+  if(!r.rows.length){tb.innerHTML='<tr><td class="empty">（池为空，跑一个因子试试）</td></tr>';return;}
+  let h='<thead><tr><th>名称</th><th>等级</th><th>Sharpe</th><th>Fitness</th><th>达标GOOD</th><th>存库</th><th>日期</th><th></th></tr></thead>';
+  for(const x of r.rows){
+    const gd=x.good?'<span class="good">✓</span>':'<span class="bad">✗</span>';
+    const saveBtn=(x.good && (x.factor||x.is_custom))
+      ?'<button class="btn-green btn-sm" onclick="poolSave('+x.id+')">存GOOD</button>':'';
+    h+='<tr><td>'+x.name+'</td><td><span class="grade '+x.grade+'">'+x.grade+'</span></td>'
+      +'<td>'+fmt(x.sharpe)+'</td><td>'+fmt(x.fitness,3)+'</td><td>'+gd+'</td><td>'+saveBtn+'</td>'
+      +'<td>'+x.created+'</td>'
+      +'<td><button class="btn-ghost btn-sm" onclick="rmPool('+x.id+')">删</button></td></tr>';
+  }
+  tb.innerHTML=h;
+}
+async function poolSave(id){
+  const r=await post('/api/pool_save',{id});
+  const st=document.getElementById('status');
+  st.textContent=r.saved?('已存库 id='+r.id+'（等级'+r.grade+'）'):('未存库：'+(r.reason||''));
+  loadPool(); loadLib();
+}
+async function rmPool(id){await post('/api/pool_rm',{id});loadPool();}
+async function loadDataCats(){
+  const box=document.getElementById('datacatsBox');
+  try{
+    const r=await (await fetch('/api/datacats')).json();
+    if(!r.ok||!r.categories.length){box.innerHTML='<div class="empty">无数据类别信息</div>';return;}
+    let h='<table class="table"><thead><tr><th>类别</th><th>来源</th><th>状态</th><th>详情</th><th>历史</th></tr></thead>';
+    for(const c of r.categories){
+      const stC = c.status==='wired'||c.status==='cached'||c.status==='available' ? '<span class="good">'+c.status+'</span>'
+                : '<span class="bad">'+c.status+'</span>';
+      h+='<tr><td><b>'+c.category+'</b></td><td style="font-size:11px">'+(c.source||'')+'</td>'
+        +'<td>'+stC+'</td><td>'+(c.detail||'')+'</td><td>'+(c.history?'<span class="good">✓可回测</span>':'<span class="bad">快照</span>')+'</td></tr>';
+    }
+    h+='</table>';
+    if(r.categories.some(c=>c.note)) h+='<div style="font-size:11px;color:var(--muted);margin-top:4px">'+r.categories.filter(c=>c.note).map(c=>c.note).join('；')+'</div>';
+    box.innerHTML=h;
+  }catch(e){ box.innerHTML='<div class="empty">加载失败</div>'; }
+}
+async function loadAnalyst(){
+  const box=document.getElementById('analystBox'); box.innerHTML='<div style="color:var(--muted)">读取分析师一致预期快照…</div>';
+  try{
+    const r=await (await fetch('/api/analyst')).json();
+    if(!r.ok||!r.rows.length){box.innerHTML='<div class="empty">'+(r.note||'无数据')+'</div>';return;}
+    let h='<table class="table"><thead><tr><th>代码</th><th>名称</th><th>研报数</th><th>买入</th><th>买入占比</th><th>前瞻EPS</th><th>前瞻FY</th><th>前瞻收益率</th></tr></thead>';
+    for(const x of r.rows){
+      h+='<tr><td>'+x.code+'</td><td><b>'+(x.name||'')+'</b></td><td>'+fmt(x.n_report,0)+'</td><td>'+fmt(x.n_buy,0)+'</td>'
+        +'<td>'+(x.buy_ratio!=null?fmt(x.buy_ratio,3):'—')+'</td><td>'+(x.fwd_eps!=null?fmt(x.fwd_eps,2):'—')+'</td>'
+        +'<td>'+(x.fwd_year||'')+'</td><td>'+(x.fwd_yield!=null?pct(x.fwd_yield):'—')+'</td></tr>';
+    }
+    h+='</table><div style="font-size:11px;color:var(--muted);margin-top:4px">共 '+r.total+' 只有一致预期 · 按覆盖广度排序（当前截面，非历史时序）</div>';
+    box.innerHTML=h;
+  }catch(e){ box.innerHTML='<div class="empty">加载失败: '+e.message+'</div>'; }
+}
+async function loadNews(refetch){
+  const box=document.getElementById('newsBox');
+  box.innerHTML='<div style="color:var(--muted)">'+(refetch?'抓取中…(约15只)':'读取新闻快照…')+'</div>';
+  try{
+    const r=await (await fetch('/api/news'+(refetch?'?refetch=1':''))).json();
+    if(!r.ok||!r.rows.length){box.innerHTML='<div class="empty">'+(r.note||'无新闻')+'</div>';return;}
+    let h='<div style="font-size:12px;color:var(--muted);margin-bottom:4px">按股票聚合情绪</div>';
+    h+='<table class="table"><thead><tr><th>代码</th><th>条数</th><th>均情绪</th><th>正占比</th><th>倾向</th></tr></thead>';
+    for(const a of (r.agg||[])){
+      const bar=a.mean_sentiment>0.15?'<span class="good">偏多</span>':a.mean_sentiment<-0.15?'<span class="bad">偏空</span>':'<span style="color:var(--muted)">中性</span>';
+      h+='<tr><td>'+a.code+'</td><td>'+a.n_news+'</td><td>'+fmt(a.mean_sentiment,2)+'</td><td>'+pct(a.pos_ratio)+'</td><td>'+bar+'</td></tr>';
+    }
+    h+='</table><div style="font-size:12px;color:var(--muted);margin:8px 0 4px">最近标题</div>';
+    h+='<table class="table"><thead><tr><th>代码</th><th>情绪</th><th>标题</th><th>时间</th></tr></thead>';
+    for(const x of r.rows.slice(0,30)){
+      const sc=x.sentiment>0.15?'<span class="good">'+(x.sentiment>0?'+':'')+fmt(x.sentiment,1)+'</span>'
+             :x.sentiment<-0.15?'<span class="bad">'+fmt(x.sentiment,1)+'</span>':'<span style="color:var(--muted)">0</span>';
+      h+='<tr><td>'+x.code+'</td><td>'+sc+'</td><td style="max-width:480px">'+((x.title||'').slice(0,60))+'</td><td style="font-size:11px">'+(x.time||'').slice(0,16)+'</td></tr>';
+    }
+    h+='</table>';
+    box.innerHTML=h;
+  }catch(e){ box.innerHTML='<div class="empty">加载失败: '+e.message+'</div>'; }
+}
+init(); loadLib(); loadPool(); loadDataCats();
+</script>
+</body>
+</html>

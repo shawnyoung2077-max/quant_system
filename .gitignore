@@ -1,0 +1,74 @@
+# ===================================================================
+# quant_system .gitignore
+# 原则：凭据、数据、第三方代码、生成物一律不提交
+# ===================================================================
+
+# ---------- 凭据 / 密钥（最高优先级，永不可提交） ----------
+data/crypto/
+data/crypto/exchange.json
+configs/
+*.env
+.env
+.env.*
+secrets.json
+credentials.json
+*_secret.*
+*_keys.*
+*api_key*
+
+# ---------- 第三方 SDK（1116 个 py 文件，绝不能提交） ----------
+vendor/
+
+# ---------- 数据（体积大，且可能含敏感字段） ----------
+data/
+*.parquet
+*.db
+*.sqlite
+*.sqlite3
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ---------- 虚拟环境 ----------
+.venv/
+venv/
+env/
+ENV/
+
+# ---------- 临时/草稿脚本（下划线开头） ----------
+_*.py
+_*.txt
+_*.json
+_*.log
+
+# ---------- 生成物 ----------
+output_real/
+output_dash/
+*.log
+*.tmp
+*.bak
+
+# ---------- IDE / 编辑器 ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- 笔记本检查点 ----------
+.ipynb_checkpoints/
