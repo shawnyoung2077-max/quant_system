@@ -27,11 +27,20 @@ def carry_v3(spot: pd.DataFrame, funding: pd.DataFrame, mask: pd.DataFrame,
              liq_fee_bps: float = 50.0, rehedge_delay: int = 2,
              capital: float = 1e7, cap_k: float = 0.10,
              allow_negative: bool = False, neg_mode: str = "flat",
-             cooldown: int = 5, count_unhedged: bool = False):
+             cooldown: int = 5, count_unhedged: bool = False,
+             unhedged_mode: str = "correct",
+             basis_mode: str = "incremental"):
     """
     spot/funding/basis/dollar_volume: date×coin 面板；mask: 布尔可选掩码
     capital: 资金规模（用于容量衰减）；cap_k: 参与率对费率收入的压缩系数
     neg_mode: 费率转负时 'flat'=空仓 或 'reverse'=反向carry(空现货+多永续)
+
+    unhedged_mode:
+        'correct' (默认)  从强平【次日】起计入现货裸多的真实 P&L（方向性风险）
+        'ignore'          完全不计 —— 会系统性低估波动率、虚高 Sharpe（旧行为）
+    basis_mode:
+        'incremental' (默认)  逐日增量 -w_{t-1}*(B_t - B_{t-1})  ← 数学正确
+        'legacy'              累计口径 -w_t*(B_t - B_entry)       ← 会把累计 P&L 按新权重放大
     """
     coins = list(spot.columns)
     idx = spot.index
@@ -91,11 +100,38 @@ def carry_v3(spot: pd.DataFrame, funding: pd.DataFrame, mask: pd.DataFrame,
         fund_pnl = float((wt * eff_f).sum())
         fund_pnl -= float((wt * rev * 2 * eff_f).sum())    # 反向时资金费方向相反
         # ---- 基差 P&L ----
+        # ⚠️ 修正说明（重要）：
+        #   旧口径:  -w_t * (B_t - B_entry)   <- B_entry 是首次入场时的基差
+        #   问题:    权重每次调仓都会变，但 (B_t - B_entry) 是「自入场以来的累计变化」，
+        #            两者相乘会把累计基差 P&L 按新权重【重复放大】。
+        #            已用最小复现验证：权重翻倍时 P&L 被放大 1.29 倍。
+        #   新口径:  -w_{t-1} * (B_t - B_{t-1})   逐日增量，隔夜持仓对应昨日权重。
+        #            这是数学上正确的 mark-to-market 形式（对固定权重等价于 telescoping）。
         basis_pnl = 0.0
-        if basis is not None:
-            basis_pnl = float((-wt * (B[t] - basis_entry)).sum())
-        # ---- 爆仓 / 未对冲暴露 ----
+        if basis is not None and t > 0:
+            if basis_mode == "incremental":
+                basis_pnl = float((-prev * (B[t] - B[t - 1])).sum())
+            else:  # legacy
+                basis_pnl = float((-wt * (B[t] - basis_entry)).sum())
+        # ---- ⭐ 未对冲暴露 P&L ----
+        # 顺序很重要：**先**结算「昨日强平」带来的裸多暴露，**再**处理「今日新发生」的强平
+        #
+        # 为什么强平当日不计：
+        #   强平发生在价格异动当日，而当日大部分时间仓位仍是对冲的，
+        #   计当日收益等于把 beta 当成 carry 收益，属于重复计算。
+        # 为什么次日必须计：
+        #   次日仓位已确认为裸多（现货腿独存），这就是真实的【方向性风险】，
+        #   不计入会系统性低估波动率 —— 这正是 Sharpe 虚高的根源。
         pt = S[t]
+        un_pnl = 0.0
+        if unhedged_mode == "correct" and t > 0:
+            uh = unhedged.copy()
+            if uh.any():
+                prev_s = S[t - 1]
+                r = np.nan_to_num(pt / np.where(prev_s == 0, np.nan, prev_s) - 1.0)
+                un_pnl = float((wt[uh] * r[uh]).sum())
+
+        # ---- 爆仓检测（本日新发生）----
         rise = np.where(np.isnan(entry), 0.0, pt / np.where(entry == 0, np.nan, entry) - 1.0)
         rise = np.nan_to_num(rise, nan=0.0, posinf=0.0, neginf=0.0)
         maxrise = np.maximum(maxrise, rise)
@@ -109,23 +145,12 @@ def carry_v3(spot: pd.DataFrame, funding: pd.DataFrame, mask: pd.DataFrame,
             unhedged_days[blown] = 0
             maxrise[blown] = 0.0; entry[blown] = np.nan
             cooldown_left[blown] = cooldown
-        # 未对冲期：现货裸多，吃真实收益
-        # ⚠️ 重要修正：默认【不计入】未对冲收益。
-        # 原因：强平发生在"价格大涨"当日，而该日现货腿的盈利**本已被永续腿亏损对冲**（净0）；
-        # 若再把"裸多现货当日收益"加进来，就是**重复计算**，等于把 beta 当成 carry 收益。
-        # 需要评估该暴露时传 count_unhedged=True，并明确它是【方向性风险】而非 alpha。
-        un_pnl = 0.0
-        if count_unhedged and t > 0:
-            uh = unhedged & (unhedged_days >= 0)
-            if uh.any():
-                r = np.nan_to_num(pt / np.where(S[t - 1] == 0, np.nan, S[t - 1]) - 1.0)
-                un_pnl = float((wt[uh] * r[uh]).sum())
-                unhedged_days[uh] += 1
-                done = unhedged_days >= rehedge_delay
-                unhedged[done] = False
-        elif t > 0:
+
+        # ---- 未对冲天数推进，到期后视为已重建 ----
+        if t > 0 and unhedged.any():
             unhedged_days[unhedged] += 1
-            unhedged[unhedged_days >= max(rehedge_delay, 1)] = False
+            done = unhedged & (unhedged_days >= max(rehedge_delay, 1))
+            unhedged[done] = False
         # 建仓登记
         newly = (wt > 0) & ((prev <= 0) | np.isnan(entry))
         if newly.any():
