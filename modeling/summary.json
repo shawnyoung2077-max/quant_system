@@ -1,0 +1,31 @@
+{
+ "n_rows": 74242,
+ "n_markets": 22051,
+ "n_leagues": 179,
+ "lead_days": [
+  1,
+  3,
+  7,
+  14,
+  21,
+  30
+ ],
+ "market_types": {
+  "moneyline": 32742,
+  "": 14920,
+  "totals": 11283,
+  "soccer_exact_score": 5875,
+  "spreads": 4010,
+  "soccer_halftime_result": 1215,
+  "soccer_team_totals": 1203,
+  "both_teams_to_score": 757,
+  "first_half_totals": 716,
+  "child_moneyline": 503,
+  "total_corners": 338,
+  "soccer_first_to_score": 169
+ },
+ "volume_median": 145384.0,
+ "volume_mean": 1088642.6471875755,
+ "league_volume_median": 3539939.1,
+ "overall_bias_lead7": 0.014475918194469639
+}
