@@ -23,6 +23,17 @@ import numpy as np
 import pandas as pd
 
 BASE = "https://api.binance.com"
+# ⚠️ 2026 实测：api.binance.com / api1.binance.com 在本机【连接超时】（被墙），
+#    但 Binance 官方公开数据镜像 data-api.binance.vision 可用（HTTP 200）。
+#    两者 /api/v3/klines 的返回结构完全一致，可直接互换。
+#    这里按顺序尝试，第一个成功的会被记住并复用，避免每次都等超时。
+BASE_FALLBACKS = [
+    "https://api.binance.com",
+    "https://data-api.binance.vision",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+]
+_ACTIVE_BASE = None
 DATA_DIR = "data/crypto"
 os.makedirs(DATA_DIR, exist_ok=True)
 META = os.path.join(DATA_DIR, "_meta.json")
@@ -40,21 +51,46 @@ UNIVERSE = [
 DEFAULT_INTERVALS = ["1d", "1h"]
 
 
+def _candidates():
+    """优先用上次成功的 base，其次是默认顺序。"""
+    if _ACTIVE_BASE:
+        return [_ACTIVE_BASE] + [b for b in BASE_FALLBACKS if b != _ACTIVE_BASE]
+    return list(BASE_FALLBACKS)
+
+
 def _get(path: str, params: dict, tries: int = 5):
+    """
+    带 base 回退的 GET。
+
+    ⚠️ 回退逻辑的存在原因：api.binance.com 在部分地区不可达（本机实测连接超时），
+       而官方的 data-api.binance.vision 可达。没有回退的话，
+       整个抓取流程会以"超时"这种最没有信息量的方式失败。
+    一旦某个 base 成功，就记住它（模块级 _ACTIVE_BASE），
+    避免后续每次请求都先等一次超时。
+    """
     import requests
+    global _ACTIVE_BASE
+    bases = _candidates()
     for i in range(tries):
-        try:
-            r = requests.get(BASE + path, params=params, timeout=30)
-            if r.status_code == 200:
-                return r.json()
-            if r.status_code in (429, 418):
-                time.sleep(2 + i * 2); continue
-            # 400 等：参数/交易对不存在
-            return {"__err__": r.status_code, "__body__": r.text[:200]}
-        except Exception as e:
-            if i == tries - 1:
-                return {"__err__": "exc", "__body__": str(e)[:200]}
-            time.sleep(1.5 + i)
+        for b in bases:
+            try:
+                r = requests.get(b + path, params=params, timeout=30)
+                if r.status_code == 200:
+                    _ACTIVE_BASE = b
+                    return r.json()
+                if r.status_code in (429, 418):
+                    time.sleep(2 + i * 2)
+                    break                       # 限速：换下一轮重试，不换 base
+                if r.status_code in (451, 403):
+                    continue                    # 地域封锁：换下一个 base
+                # 400 等：参数/交易对不存在（与 base 无关，直接返回）
+                return {"__err__": r.status_code, "__body__": r.text[:200]}
+            except Exception as e:
+                last = str(e)
+                continue                        # 连接失败：换下一个 base
+        if i == tries - 1:
+            return {"__err__": "exc", "__body__": last[:200] if 'last' in dir() else ""}
+        time.sleep(1.5 + i)
     return None
 
 
