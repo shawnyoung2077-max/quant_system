@@ -1,0 +1,117 @@
+sports catalog: 473 个联赛
+抓取 473 个联赛 tag ...
+  ... 50/140, 累计 471
+  ... 100/140, 累计 672
+抓到原始市场 2499 条
+去重后 2482 个市场
+有效记录 2482
+
+====================================================================================================
+1. 市场类型分布（我们要 moneyline 这类'价格=概率'的）
+====================================================================================================
+  (空)                              938
+  moneyline                        275
+  soccer_exact_score               218
+  soccer_first_corner              149
+  soccer_team_total_corners        100
+  cricket_team_top_batter          99
+  total_corners                    91
+  soccer_second_half_total_corners 67
+  soccer_first_half_total_corners  60
+  cricket_most_sixes               54
+  cricket_toss_match_double        50
+  soccer_game_corners_odd_even     47
+  cricket_match_to_go_till         39
+  soccer_halftime_result           33
+  soccer_second_half_result        30
+
+====================================================================================================
+2. 价格档分布（有报价的市场）
+====================================================================================================
+  有报价: 1539 / 2482 (62%)
+  (0.0, 0.05]      231
+  (0.05, 0.1]      85
+  (0.1, 0.15]      55
+  (0.15, 0.2]      53
+  (0.2, 0.3]       85
+  (0.3, 0.5]       830
+  (0.5, 0.7]       127
+  (0.7, 0.9]       37
+  (0.9, 1.01]      36
+
+====================================================================================================
+3. 距结算天数分布（决定节奏）
+====================================================================================================
+  中位=3.3 天  均值=26.7 最小=-253.41 最大=296.8
+  24小时内          0
+  1天内          103
+  1-3天         225
+  3-7天          96
+  7-30天        336
+  30天以上        813
+
+====================================================================================================
+4. 冷门联赛盘点（成交额低 = 机构覆盖薄 = 我们想找的）
+====================================================================================================
+  联赛                            市场数      有报价         24h成交额          累计成交额
+  --------------------------------------------------------------------------------------------
+  LaLiga                        100       82           1997        7655590
+  College Football              100       95           4646         952876
+  LoL                           100       46           1213         938040
+  World Cup                      20       12            705         282790
+  International                 100       31              0         122617
+  LIV Golf                        1        1            268          76609
+  Boxing                         27       27            132          34092
+  Veikkausliiga                 100       75          16323          24127
+  Dota 2                        100        9              0          14900
+  League of Ireland Premier     100       55           7349          14438
+  Danish Superliga              100       91            774          11559
+  Austria Bundesliga            100       89            198          10630
+  Besta deild karla             100       73             20           9111
+  K League 1                     83       66            786           7472
+  Virslīga                      100       37              0           5227
+  Premium Liiga                 100       57            138           4734
+  Betri deildin                  63       40              0           4124
+  Uzbekistan Super League       100       85             20           3728
+  Superettan                    100       45              0           1642
+  MODUS Super Series             50       50           1506           1506
+  FIFA Friendlies               100        9              0           1241
+  World Championship of Lege    100       47            148           1092
+  OBOS-ligaen                   100       73              0            708
+  Pakistan Super League          14        1              0            682
+  DFB-Pokal                      40       36              0            546
+
+====================================================================================================
+5. 目标标的：冷门联赛 + 有报价 + 近期结算
+====================================================================================================
+  冷门联赛（累计成交额 < 中位 $708）: 22 个
+  目标候选（冷门 + 有报价 + 14天内结算）: 193 个
+
+  联赛             问题                                           bid     ask     mid      距结算     24h额
+  ----------------------------------------------------------------------------------------------------
+  Liiga          Jokerit Helsinki vs. HIFK Helsinki         0.550   0.570   0.560     7.3      231
+  K League 2     Will Suwon FC win on 2026-10-09?           0.470   0.480   0.475     0.8        7
+  Liga ACB       CB Breogan Lugo vs. Basquet Girona         0.650   0.770   0.710     9.4        0
+  Betclic Élite  Boulazac vs. Bourg-en-Bresse               0.250   0.380   0.315     9.4        0
+  Betclic Élite  Spread: Bourg-en-Bresse (-5.5)             0.020   0.980   0.500     2.4        0
+  Betclic Élite  Spread: Chalon/Saone (-8.5)                0.430   0.550   0.490     2.3        0
+  Betclic Élite  Chalon/Saone vs. Nancy: O/U 163.5          0.010   0.990   0.500     2.3        0
+  Betclic Élite  Spread: Nanterre (-9.5)                    0.020   0.980   0.500     2.3        0
+  Betclic Élite  Nanterre vs. BCM Gravelines Dunkerque: O   0.010   0.990   0.500     2.3        0
+  Betclic Élite  Spread: Cholet (-10.5)                     0.020   0.980   0.500     2.3        0
+  Betclic Élite  Cholet vs. Pau-Orthez: O/U 163.5           0.010   0.990   0.500     2.3        0
+  Liga ACB       Joventut vs. Basquet Club Andorra          0.010   0.990   0.500     2.3        0
+  Liga ACB       Basquet Coruna vs. Basket Zaragoza         0.470   0.590   0.530     9.3        0
+  Betclic Élite  Nanterre vs. BCM Gravelines Dunkerque      0.750   0.870   0.810     9.3        0
+  Liga ACB       Unicaja vs. Basquet Club Andorra           0.860   0.970   0.915     9.4        0
+  Liga ACB       Monbus Obradoiro vs. Forca Lleida CE       0.590   0.710   0.650    10.0        0
+  Liga ACB       Bilbao Basket vs. Burgos                   0.650   0.770   0.710    10.3        0
+  Liga ACB       CB Murcia vs. La Laguna Tenerife           0.030   0.970   0.500    10.1        0
+  Liga ACB       Real Madrid vs. Manresa                    0.560   0.960   0.760    10.0        0
+  Liga ACB       Barcelona vs. Valencia                     0.550   0.670   0.610    10.3        0
+
+====================================================================================================
+6. 三向市场是怎么表示的？（足球有主/平/客）
+====================================================================================================
+  groupItemTitle 取值（前10）: ['Draw', 'Team to Take First Corner', 'Match goes to Day 3?', 'Match goes to Day 4?', 'Match goes to Day 5?', 'Hwaseong FC', 'Suwon FC', 'Busan IPark', 'Chungnam Asan', 'Daegu FC']
+  含 >=3 个市场的 event 数 = 306（三向市场会拆成多个二元市场）

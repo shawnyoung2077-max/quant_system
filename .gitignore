@@ -72,3 +72,9 @@ desktop.ini
 
 # ---------- 笔记本检查点 ----------
 .ipynb_checkpoints/
+
+# polytrade 运行产物
+polytrade_logs/
+polytrade_out/
+data/*.sqlite
+polytrade_run.bat
