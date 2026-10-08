@@ -78,3 +78,8 @@ polytrade_logs/
 polytrade_out/
 data/*.sqlite
 polytrade_run.bat
+
+# 建模交付包（由脚本重建，不入库）
+modeling_package/
+modeling/*_sample.csv
+modeling/*_cold_leagues.csv
