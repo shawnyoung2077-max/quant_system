@@ -1,0 +1,101 @@
+====================================================================================================
+Polymarket 实时盘口分析
+====================================================================================================
+
+====================================================================================================
+1. 官方费率公式（来源：docs.polymarket.com/cn/trading/fees，已实测可达）
+====================================================================================================
+
+  官方原文：
+     fee = C x feeRate x p x (1 - p)
+     其中 C = 交易的份额数量，p = 份额价格
+
+  * 这与我原先假设的 rate x min(p, 1-p) 不同 —— 是 p x (1-p)。
+    对 p=0.12: 官方=0.05x0.12x0.88=0.00528/股；
+              我的旧假设=0.05x0.12=0.00600/股。
+    官方口径【更低】约 12%%，方向对我有利，但仍需修正。
+
+  官方费率表（Taker Fee Rate）：
+     加密货币         taker=0.07  maker=0  maker返利=20%
+     体育           taker=0.05  maker=0  maker返利=15%
+     金融           taker=0.04  maker=0  maker返利=25%
+     政治           taker=0.04  maker=0  maker返利=25%
+     经济           taker=0.05  maker=0  maker返利=25%
+     文化           taker=0.05  maker=0  maker返利=25%
+     天气           taker=0.05  maker=0  maker返利=25%
+     其他/通用        taker=0.05  maker=0  maker返利=25%
+     Mentions     taker=0.04  maker=0  maker返利=25%
+     科技           taker=0.04  maker=0  maker返利=25%
+     地缘政治         taker=0.00  maker=0  maker返利=-
+
+  ★★ 重要：Maker 费用 = 0，且有 15%% 返利（体育档）
+     『Maker 不收取任何费用。只有 Taker 支付费用。』
+     ⇒ 挂限价单（maker）不但不付手续费，还能分到 taker 交的费用！
+     这会让整个成本结构改变 —— 代价是承担【逆向选择】风险
+     （你的限价单只在市场朝不利方向走时成交）。详见第 4 节。
+
+====================================================================================================
+2. 实时市场快照：价差与深度
+====================================================================================================
+
+  抓到 400 个未结算市场
+  字段: ['bestAsk', 'bestBid', 'feeType', 'feesEnabled', 'lastTradePrice', 'liquidity', 'liquidityClob', 'liquidityNum', 'oneMonthPriceChange', 'oneWeekPriceChange', 'orderPriceMinTickSize', 'outcomePrices', 'rewardsMaxSpread', 'spread', 'volume', 'volume1mo', 'volume1moClob', 'volume1wk', 'volume1wkClob', 'volume1yr', 'volume1yrClob', 'volume24hr', 'volume24hrClob', 'volumeClob', 'volumeNum']
+
+  可用盘口字段的市场: 400
+
+  实时价差分布（全部未结算市场, n=400）:
+     p10   = 0.0010
+     p25   = 0.0010
+     p50   = 0.0020
+     p75   = 0.0100
+     p90   = 0.0200
+     p99   = 0.0709
+     均值 = 0.0096
+
+  按价格档看实时价差（这才是关键 —— 价差随价格变化）:
+  价格区间                 样本       价差中位       价差均值       占价格%   vs edge 2%
+  --------------------------------------------------------------------------------------------
+  0.00-0.05           199     0.0010     0.0045       8.7%          可承受
+  0.05-0.10            38     0.0100     0.0135      14.9%          可承受
+  0.10-0.15            18     0.0100     0.0242       7.8%          可承受
+  0.15-0.20            14     0.0100     0.0204       6.2%          可承受
+  0.20-0.50            29     0.0100     0.0294       2.7%          可承受
+  0.50-0.80            23     0.0200     0.0241       6.2%     价差吃掉>50%
+  0.80-0.85             5     0.0200     0.0182      11.4%     价差吃掉>50%
+  0.85-0.90             3     0.0100     0.0133       8.0%          可承受
+  0.90-0.95             3     0.0100     0.0100      15.4%          可承受
+  0.95-1.01             8     0.0065     0.0076      30.6%          可承受
+
+====================================================================================================
+4. 深度：单笔能吃掉多少？（用 CLOB 订单簿实测）
+====================================================================================================
+
+  0.10-0.15 档且有成交额的市场: 18 个
+  问题                                                              bid      ask        成交额
+  Will Alexandria Ocasio-Cortez win the 2028 US Presidential E    0.131    0.132   13855555
+  Will New York Knicks win the 2027 NBA Finals?                 0.120    0.130     871544
+  Will Real Madrid win the 2026-27 UEFA Champions League Champ    0.100    0.110     825293
+  Puffpaw FDV above $300M one day after launch?                 0.106    0.115     779435
+  US x Cuba military clash in 2026?                             0.120    0.140     269711
+  Extended FDV above $800M one day after launch?                0.110    0.130     254446
+  Will Аndrey Gyurov win the next Bulgarian presidential elect    0.130    0.140     253060
+  Masoud Pezeshkian out by December 31?                         0.120    0.170     234070
+
+  --- 订单簿深度实测（取若干 0.10-0.15 档市场）---
+  问题                                                   中间价          买盘$          卖盘$   bid档   ask档
+  Will Alexandria Ocasio-Cortez win the 2028 US      0.132         4720      9080436     85    111
+  Will New York Knicks win the 2027 NBA Finals?      0.125         3482      3199402     12     37
+  Will Real Madrid win the 2026-27 UEFA Champion     0.105        24783      2259203     10     56
+  Puffpaw FDV above $300M one day after launch?      0.111           67       209230     20     39
+  US x Cuba military clash in 2026?                  0.130         5605        91627     12     42
+  Extended FDV above $800M one day after launch?     0.120         1198       261873     11     32
+  Will Аndrey Gyurov win the next Bulgarian pres     0.135         2839        69292     13     52
+  Masoud Pezeshkian out by December 31?              0.145          384         3396     11     14
+  Zhang Youxia sentenced to prison before 2027?      0.115          711        65663     11     41
+  Will inflation reach more than 4.5% in 2026?       0.120         1737         6213     10     18
+  Will Anthropic's market cap be between $2.5T a     0.136          101        56276     44     71
+  Will Bitcoin reach $95,000 in October?             0.135         2062       265068     13     40
+
+  买盘前10档累计美元: 中位=$1899 均值=$3974
+  卖盘前10档累计美元: 中位=$150429 均值=$1297307
+  ⇒ 单笔可成交规模约在【$百 ~ $千】量级（乐观取两倍做缓冲）
