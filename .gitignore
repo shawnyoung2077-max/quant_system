@@ -83,3 +83,5 @@ polytrade_run.bat
 modeling_package/
 modeling/*_sample.csv
 modeling/*_cold_leagues.csv
+
+modeling/*.sqlite

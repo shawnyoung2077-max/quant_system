@@ -1,0 +1,92 @@
+{
+  "data_rows_with_dates": 74242,
+  "markets_with_dates": 22051,
+  "markets_missing_date": 0,
+  "train_markets": 17638,
+  "test_markets": 4413,
+  "test_rows": 13580,
+  "cutoff_utc": "2026-07-15T00:00:00+00:00",
+  "oos_brier_model": 0.20308145363216998,
+  "oos_brier_market_price": 0.20472355169072165,
+  "oos_brier_skill_vs_market_price": 0.008021051046595784,
+  "oos_mae_model": 0.3921060472253352,
+  "oos_mae_market_price": 0.38919600883652433,
+  "brier_diff_cluster_bootstrap_95ci": [
+    0.00014374364751417113,
+    0.003186297998673866
+  ],
+  "brier_skill_cluster_bootstrap_95ci": [
+    0.0007123698393438657,
+    0.015444337077974438
+  ],
+  "entry_rule": "one decision per market at lead_days == 3",
+  "eligible_trade_rows": 2981,
+  "trade_rate_among_3day_rows": 0.7138409961685823,
+  "estimated_cost_mean_when_traded": 0.015235053581013083,
+  "predicted_gross_edge_mean_when_traded": 0.054782268005264825,
+  "predicted_net_edge_mean_per_trade": 0.03954721442425174,
+  "realized_gross_edge_mean_per_trade": 0.05836095270043609,
+  "realized_net_edge_mean_per_trade": 0.04312589911942301,
+  "realized_net_edge_cluster_bootstrap_95ci_per_trade": [
+    0.02588582004977772,
+    0.060822903998655586
+  ],
+  "realized_net_edge_mean_per_3day_opportunity": 0.03078503478807471,
+  "realized_net_edge_cluster_bootstrap_95ci_per_opportunity": [
+    0.01862417417443321,
+    0.043307546387827564
+  ],
+  "predicted_net_edge_cluster_bootstrap_95ci_per_3day_opportunity": [
+    0.027136864200039832,
+    0.029293011898813517
+  ],
+  "market_volume_quartiles_descriptive_lifetime_volume": [
+    {
+      "vol_q": 1,
+      "n": 18563,
+      "mean_price": 0.3823252706997791,
+      "mean_outcome": 0.38668318698486237,
+      "signed_bias": 0.004357916285083225,
+      "abs_error": 0.38282799116522115
+    },
+    {
+      "vol_q": 2,
+      "n": 18561,
+      "mean_price": 0.36072410969236574,
+      "mean_outcome": 0.3647971553256829,
+      "signed_bias": 0.004073045633317165,
+      "abs_error": 0.3601903561230537
+    },
+    {
+      "vol_q": 3,
+      "n": 18561,
+      "mean_price": 0.3631992888314207,
+      "mean_outcome": 0.38316901029039385,
+      "signed_bias": 0.01996972145897311,
+      "abs_error": 0.3543371585582673
+    },
+    {
+      "vol_q": 4,
+      "n": 18557,
+      "mean_price": 0.3631545346769413,
+      "mean_outcome": 0.3911731422104866,
+      "signed_bias": 0.028018607533545285,
+      "abs_error": 0.3363164358463113
+    }
+  ],
+  "volume_bias_after_common_price_lead_strata": {
+    "1": 0.00021618598253542068,
+    "2": 0.004138094532080313,
+    "3": 0.021212617409625087,
+    "4": 0.033122891042648685
+  },
+  "transaction_cost_assumptions": {
+    "sports_fee_rate": 0.05,
+    "half_spread_per_share": 0.005
+  },
+  "limitations": [
+    "Lifetime volume and observation count excluded from predictive features because they are post-close fields.",
+    "The test is chronological by market end date, but this dataset has no archived point-in-time order book; spread cost is an assumed 0.5 cents/share.",
+    "This predicts average calibration, not fills or realized portfolio return. Bootstrap clusters by market; same-event cross-market dependence can remain."
+  ]
+}

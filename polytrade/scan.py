@@ -79,7 +79,11 @@ def to_frame(markets):
             ask = float(m["bestAsk"]) if m.get("bestAsk") not in (None, "") else None
             ed = m.get("endDate")
             end = pd.to_datetime(ed, errors="coerce", utc=True) if ed else pd.NaT
+            # ★ 开赛时间：判"是否赛前"必须用它，不能用 end_date（结算日常滞后）
+            gs = m.get("gameStartTime")
+            gstart = pd.to_datetime(gs, errors="coerce", utc=True) if gs else pd.NaT
             d2e = (end - now).total_seconds() / 86400 if pd.notna(end) else None
+            d2s = (gstart - now).total_seconds() / 86400 if pd.notna(gstart) else None
             recs.append({
                 "market_id": m.get("id") or m.get("conditionId"),
                 "slug": m.get("slug") or "",
@@ -91,7 +95,9 @@ def to_frame(markets):
                 "mid": ((bid + ask) / 2) if (bid is not None and ask is not None) else None,
                 "spread": (ask - bid) if (bid is not None and ask is not None) else None,
                 "days_to_end": d2e,
+                "days_to_start": d2s,
                 "end_date": end.isoformat() if pd.notna(end) else None,
+                "game_start": gstart.isoformat() if pd.notna(gstart) else None,
                 "vol24": float(m.get("volume24hr") or 0),
                 "volnum": float(m.get("volumeNum") or 0),
                 "liq": float(m.get("liquidityNum") or 0),
@@ -205,6 +211,7 @@ def run_scan(verbose=True, dry=False):
             "league": r["league"], "market_type": r["market_type"],
             "group_title": r["group_title"], "bid": r["bid"], "ask": r["ask"],
             "mid": r["mid"], "spread": r["spread"], "days_to_end": r["days_to_end"],
+            "days_to_start": r["days_to_start"], "game_start": r.get("game_start"),
             "end_date": r["end_date"], "vol24": r["vol24"], "volnum": r["volnum"],
             "liq": r["liq"], "is_cold": int(r["is_cold"]),
             "ref_fair": None, "ref_source": None,
@@ -213,21 +220,36 @@ def run_scan(verbose=True, dry=False):
         n_obs += 1
     conn.commit()
 
-    # ---- 纸面下注 ----
+    # ---- 纸面下注（v2：按价格档规则 + 按开赛时间过滤赛前）----
     n_bets = 0
     if not dry:
         open_n = conn.execute(
             "SELECT COUNT(*) c FROM bets WHERE status='open'").fetchone()["c"]
         room = max(0, C.MAX_OPEN_BETS - open_n)
-        # 优先冷门联赛；同联赛内按 24h 成交额降序（先做流动性好的）
-        pick = bet_cand[bet_cand["is_cold"] == 1].sort_values("vol24", ascending=False)
-        pick = pick.head(min(C.MAX_NEW_BETS_PER_RUN, room))
-        for _, r in pick.iterrows():
-            ex = conn.execute("SELECT 1 FROM bets WHERE market_id=?",
-                              (r["market_id"],)).fetchone()
+        # 赛前过滤：必须有开赛时间，且在 (0, ENTRY 窗口] 天内
+        cand = bet_cand[bet_cand["days_to_start"].notna()
+                        & (bet_cand["days_to_start"] > 0)
+                        & (bet_cand["days_to_start"] <= max(C.ENTRY_LEAD_DAYS) + 0.5)]
+        cand = cand.sort_values("vol24", ascending=False)
+        picked = 0
+        for _, r in cand.iterrows():
+            if picked >= min(C.MAX_NEW_BETS_PER_RUN, room):
+                break
+            # 按价格档决定方向
+            rule_hit = None
+            for lo, hi, sdir, note in C.BET_RULES:
+                if lo <= r["mid"] < hi:
+                    rule_hit = (sdir, note, lo, hi)
+                    break
+            if rule_hit is None:
+                continue
+            side, note, lo, hi = rule_hit
+            # 同一个 (market, rule) 只下一注
+            ex = conn.execute(
+                "SELECT 1 FROM bets WHERE market_id=? AND rule_lo=? AND rule_hi=?",
+                (r["market_id"], lo, hi)).fetchone()
             if ex:
                 continue
-            side = C.DEFAULT_SIDE
             px = entry_price(r, side)
             if not (0.0 < px < 1.0):
                 continue
@@ -235,11 +257,16 @@ def run_scan(verbose=True, dry=False):
             fee = calc_fee(px, shares)
             conn.execute(
                 "INSERT INTO bets(market_id,league,question,side,entry_price,entry_mid,"
-                "shares,stake,entry_ts,entry_date,days_to_end,status) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,'open')",
+                "shares,stake,fee,entry_ts,entry_date,days_to_end,days_to_start,"
+                "game_start,rule_lo,rule_hi,rule_note,event_key,status) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open')",
                 (r["market_id"], r["league"], r["question"], side, px, r["mid"],
-                 shares, C.STAKE, ts, today, r["days_to_end"]))
+                 shares, C.STAKE, fee, ts, today, r["days_to_end"], r["days_to_start"],
+                 r.get("game_start"), lo, hi, note,
+                 # 赛事级聚类键：联赛 + 开赛日（同一场比赛的多个市场共享它）
+                 "%s|%s" % (r["league"], str(r.get("game_start"))[:10])))
             n_bets += 1
+            picked += 1
         conn.commit()
 
     D.log_run(conn, "scan", n_scanned=len(df), n_new_obs=n_obs, n_new_bets=n_bets)

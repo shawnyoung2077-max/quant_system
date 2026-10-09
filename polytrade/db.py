@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS observations (
     mid           REAL,
     spread        REAL,
     days_to_end   REAL,
+    days_to_start REAL,                   -- 距【开赛】天数（判赛前必须用它）
+    game_start    TEXT,
     end_date      TEXT,
     vol24         REAL, volnum REAL, liq REAL,
     is_cold       INTEGER,                -- 是否冷门联赛
@@ -50,7 +52,7 @@ CREATE INDEX IF NOT EXISTS idx_obs_date   ON observations(snap_date);
 
 CREATE TABLE IF NOT EXISTS bets (
     bet_id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    market_id     TEXT UNIQUE,            -- 一个市场只下一注
+    market_id     TEXT,                   -- 同一市场的不同规则可各下一注
     league        TEXT,
     question      TEXT,
     side          TEXT,                   -- 'YES' / 'NO'
@@ -61,6 +63,12 @@ CREATE TABLE IF NOT EXISTS bets (
     entry_ts      TEXT,
     entry_date    TEXT,
     days_to_end   REAL,
+    days_to_start REAL,                   -- 入场时距开赛天数（用于分时点评估）
+    game_start    TEXT,
+    rule_lo       REAL,                   -- 命中规则的区间（用于事后归因）
+    rule_hi       REAL,
+    rule_note     TEXT,
+    event_key     TEXT,                   -- 赛事级聚类键（联赛|开赛日）
     ref_fair      REAL,
     edge_at_entry REAL,                   -- 参照公允 - 成交价（YES 口径）
     status        TEXT DEFAULT 'open',    -- open / settled
@@ -110,7 +118,8 @@ def upsert_observation(conn, row):
     """插入观测；同 (market_id, snap_date) 已存在则更新价格（保留最新）。"""
     cols = ["snap_date", "snap_ts", "market_id", "slug", "question", "league",
             "market_type", "group_title", "bid", "ask", "mid", "spread",
-            "days_to_end", "end_date", "vol24", "volnum", "liq", "is_cold",
+            "days_to_end", "days_to_start", "game_start", "end_date",
+            "vol24", "volnum", "liq", "is_cold",
             "ref_fair", "ref_source", "neg_risk", "fee_type"]
     vals = [row.get(c) for c in cols]
     ph = ",".join("?" * len(cols))
@@ -118,7 +127,8 @@ def upsert_observation(conn, row):
         "INSERT INTO observations(%s) VALUES(%s) "
         "ON CONFLICT(market_id, snap_date) DO UPDATE SET "
         "snap_ts=excluded.snap_ts, bid=excluded.bid, ask=excluded.ask, "
-        "mid=excluded.mid, spread=excluded.spread, days_to_end=excluded.days_to_end, "
+        "mid=excluded.mid, spread=excluded.spread, "
+        "days_to_end=excluded.days_to_end, days_to_start=excluded.days_to_start, "
         "vol24=excluded.vol24, volnum=excluded.volnum, liq=excluded.liq, "
         "ref_fair=excluded.ref_fair, ref_source=excluded.ref_source"
         % (",".join(cols), ph), vals)
