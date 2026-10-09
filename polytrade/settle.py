@@ -49,21 +49,34 @@ def fetch_resolution(market_id):
     return closed, oy, m
 
 
-def settle_bets(verbose=True, sleep=0.25):
+def settle_bets(verbose=True, sleep=0.0, workers=8):
+    """
+    结算所有 open 的注。
+
+    ★ 性能：原先逐笔串行 + 每笔 sleep 0.25s，100 笔要 25 秒以上的纯等待。
+      改成 8 线程并发（默认 sleep=0）。结算幂等（只按 market_id 查询），
+      并发不会造成竞态。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
     conn = D.connect()
     rows = conn.execute(
-        "SELECT bet_id, market_id, side, entry_price, shares, stake, fee "
-        "FROM bets WHERE status='open'").fetchall()
-    # fee 列可能为空（下注时没算），这里补算
+        "SELECT bet_id, market_id, side, entry_price, shares, stake FROM bets "
+        "WHERE status='open'").fetchall()
+
+    def one(r):
+        closed, oy, _ = fetch_resolution(r["market_id"])
+        return r, closed, oy
+
+    results = []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        results = list(ex.map(one, rows))
+
     n_settled = 0
-    for r in rows:
-        closed, oy, raw = fetch_resolution(r["market_id"])
-        if closed is None:
-            continue
-        if not closed or oy is None:
-            if verbose:
-                print("  [settle] %s 未结算，跳过" % r["market_id"], flush=True)
-            time.sleep(sleep)
+    n_pending = 0
+    for r, closed, oy in results:
+        if closed is None or not closed or oy is None:
+            n_pending += 1
             continue
         px = float(r["entry_price"])
         shares = float(r["shares"])
@@ -82,8 +95,10 @@ def settle_bets(verbose=True, sleep=0.25):
             print("  [settle] %s side=%s px=%.3f yes=%d -> %s pnl=%+.4f"
                   % (r["market_id"], side, px, oy, "WIN" if won else "LOSS", pnl),
                   flush=True)
-        time.sleep(sleep)
     conn.commit()
+    if verbose:
+        print("  [settle] 已结算 %d 笔，未到期 %d 笔" % (n_settled, n_pending),
+              flush=True)
     if n_settled:
         D.log_run(conn, "settle", n_settled=n_settled)
     conn.close()

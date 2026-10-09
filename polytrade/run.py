@@ -74,6 +74,18 @@ def main():
             p = RP.save_report(txt, "report_%s.txt" % dt.datetime.now().strftime("%Y%m%d"))
             RP.save_report(txt, "report_latest.txt")
             out("      报告已写出: %s" % p)
+            # 看门狗 + 每日简报（人可读，打开就能看）
+            try:
+                from . import digest as DG
+                issues, _ = DG.health_check()
+                dp = DG.save_digest()
+                out("      简报已写出: %s" % dp)
+                if issues:
+                    out("      ! 发现 %d 个异常:" % len(issues))
+                    for i in issues:
+                        out("        %s" % i)
+            except Exception as e:
+                out("      简报步骤跳过: %s" % str(e)[:120])
         elif args.report_only:
             txt = RP.report()
             RP.save_report(txt, "report_latest.txt")
