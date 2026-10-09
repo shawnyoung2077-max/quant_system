@@ -7,9 +7,50 @@ config.py - 纸面交易系统的全部可调参数（集中一处，便于事�
 """
 
 import os
+import socket
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(BASE)
+
+# ---------------------------------------------------------------------------
+# ★ 代理：必须显式设置，不能依赖系统代理
+# ---------------------------------------------------------------------------
+# 为什么必须写死：
+#   实测本机的 HTTP_PROXY/HTTPS_PROXY 环境变量在【用户级和系统级都是空的】。
+#   Python 的 requests 走的是 urllib.getproxies()，而它读的是
+#   HKCU\...\Internet Settings（用户级注册表，只在该用户登录时加载）。
+#   任务以「不管用户是否登录都运行」启动时，HKCU 是否被加载并不确定
+#   —— 一旦没加载，Polymarket 就访问不了，任务静默失败。
+#   所以这里显式把代理塞进环境变量，消除整类不确定性。
+#
+# 自动探测：端口在监听才设，否则跳过（换网络/关代理时仍能用）。
+PROXY_CANDIDATES = ["http://127.0.0.1:7897", "http://127.0.0.1:7890"]
+
+def _detect_proxy():
+    for p in PROXY_CANDIDATES:
+        try:
+            hostport = p.split("//", 1)[1]
+            host, port = hostport.rsplit(":", 1)
+            s = socket.create_connection((host, int(port)), timeout=1.0)
+            s.close()
+            return p
+        except Exception:
+            continue
+    return None
+
+PROXY = os.environ.get("POLYTRADE_PROXY") or _detect_proxy()
+if PROXY:
+    os.environ.setdefault("HTTP_PROXY", PROXY)
+    os.environ.setdefault("HTTPS_PROXY", PROXY)
+    os.environ.setdefault("http_proxy", PROXY)
+    os.environ.setdefault("https_proxy", PROXY)
+    # 本机地址不走代理
+    os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1,::1")
+    os.environ.setdefault("no_proxy", "localhost,127.0.0.1,::1")
+
+# ---------------------------------------------------------------------------
+# 数据源
+# ---------------------------------------------------------------------------
 DB_PATH = os.path.join(ROOT, "data", "polytrade.sqlite")
 LOG_DIR = os.path.join(ROOT, "polytrade_logs")
 OUT_DIR = os.path.join(ROOT, "polytrade_out")
@@ -129,4 +170,11 @@ USE_OFFICIAL_FEE = True
 # 运行
 # ---------------------------------------------------------------------------
 HTTP_TIMEOUT = 40
-HTTP_RETRIES = 3
+HTTP_RETRIES = 5
+
+# ★ 代理抖动说明（实测）：
+#   本机代理连通性【不稳定】—— 同一变体三轮测试会出现 200/ERR/ERR 的混合。
+#   这不是配置问题，是代理链路本身在抖。
+#   对 7x24 的后果：单次抓取里若连续几次都撞上抖动窗口，该轮就会少抓数据。
+#   对策：HTTP_RETRIES 从 3 提到 5，并在 _get 里对「连接类异常」退避重试
+#   （4xx/5xx 属于服务端答复，不重试；连接重置/超时属于链路问题，必须重试）。
