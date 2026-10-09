@@ -170,6 +170,16 @@ CREATE TABLE IF NOT EXISTS odds_fetch_log (
 
 def ensure_schema(conn):
     conn.executescript(QUOTA_SCHEMA)
+    # ★ 三向公允概率必须都存下来。
+    #   初版只存了主队（fair_mult = fm[0]）——那样给客队/平局市场填 ref_fair 时
+    #   会把【主队】的公允价填到客队市场上，产生完全错误的参照价。
+    #   用一列 JSON 存 [mult3, power3, shin3]，避免加 6 个列。
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(odds_fixtures)")]
+    if "fair_json" not in cols:
+        try:
+            conn.execute("ALTER TABLE odds_fixtures ADD COLUMN fair_json TEXT")
+        except Exception:
+            pass
     conn.commit()
 
 
@@ -265,15 +275,17 @@ def fetch_league(conn, sport_key, regions="eu", markets="h2h",
             conn.execute(
                 "INSERT INTO odds_fixtures(fetched_ts,sport_key,commence_time,home,away,"
                 "odds_home,odds_away,odds_draw,fair_mult,fair_power,fair_shin,"
-                "overround,bookmaker) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "overround,bookmaker,fair_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(sport_key,commence_time,home,away) DO UPDATE SET "
                 "fetched_ts=excluded.fetched_ts, odds_home=excluded.odds_home, "
                 "odds_away=excluded.odds_away, odds_draw=excluded.odds_draw, "
                 "fair_mult=excluded.fair_mult, fair_power=excluded.fair_power, "
-                "fair_shin=excluded.fair_shin, overround=excluded.overround",
+                "fair_shin=excluded.fair_shin, overround=excluded.overround, "
+                "fair_json=excluded.fair_json",
                 (D.now_iso(), sport_key, ct, home, away, oh, oa, odr,
                  fm[0] if fm else None, fp[0] if fp else None, fs[0] if fs else None,
-                 overround(order), bookmaker))
+                 overround(order), bookmaker,
+                 json.dumps([fm, fp, fs]) if fm else None))
             n += 1
     conn.commit()
     return n, "OK (HTTP 200, 剩余额度 %s)" % r.headers.get("x-requests-remaining")
@@ -376,6 +388,47 @@ def fetch_all(conn=None, verbose=True, only_active=True):
     if own:
         conn.close()
     return tot
+
+
+def fill_ref_fair(conn, verbose=False):
+    """
+    把 odds_fixtures 的三向公允概率，按 market_fixture 的 fixture_side
+    填进 observations.ref_fair（YES 口径，与 observations.mid 同口径）。
+
+      fixture_side='home' -> 主队胜的公允概率
+      fixture_side='away' -> 客队胜的公允概率
+      fixture_side='draw' -> 平局的公允概率
+
+    ★ 必须按 side 取对应的分量。初版只存了主队值，若不分 side 就会把
+      主队的公允价填到客队市场上（错误数据）。已用 fair_json 修正。
+    """
+    ensure_schema(conn)
+    rows = conn.execute(
+        "SELECT mf.market_id, mf.fixture_side, f.fair_json "
+        "FROM market_fixture mf JOIN odds_fixtures f ON f.fid = mf.fid "
+        "WHERE f.fair_json IS NOT NULL").fetchall()
+    idx_map = {"home": 0, "away": 1, "draw": 2}
+    n = 0
+    for r in rows:
+        idx = idx_map.get(r["fixture_side"])
+        if idx is None:
+            continue
+        try:
+            # fair_json = [mult3, power3, shin3]，每个是 [home, away, draw]
+            vec = json.loads(r["fair_json"])
+            mult = vec[0][idx] if vec[0] else None
+        except Exception:
+            continue
+        if mult is None:
+            continue
+        conn.execute(
+            "UPDATE observations SET ref_fair=?, ref_source=? WHERE market_id=?",
+            (float(mult), "pinnacle_h2h_%s" % r["fixture_side"], r["market_id"]))
+        n += 1
+    conn.commit()
+    if verbose:
+        print("  [refodds] 填入 %d 行 ref_fair" % n, flush=True)
+    return n
 
 
 def main():
