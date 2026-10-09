@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS bets (
     rule_hi       REAL,
     rule_note     TEXT,
     event_key     TEXT,                   -- 赛事级聚类键（联赛|开赛日）
+    target_lead   INTEGER,                -- 目标入场时点 7/3/1（分时点评估用）
     ref_fair      REAL,
     edge_at_entry REAL,                   -- 参照公允 - 成交价（YES 口径）
     status        TEXT DEFAULT 'open',    -- open / settled

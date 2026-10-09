@@ -220,13 +220,13 @@ def run_scan(verbose=True, dry=False):
         n_obs += 1
     conn.commit()
 
-    # ---- 纸面下注（v2：按价格档规则 + 按开赛时间过滤赛前）----
+    # ---- 纸面下注（v3：按价格档规则 + 赛前过滤 + 1/3/7 天分时点建仓）----
     n_bets = 0
     if not dry:
         open_n = conn.execute(
             "SELECT COUNT(*) c FROM bets WHERE status='open'").fetchone()["c"]
         room = max(0, C.MAX_OPEN_BETS - open_n)
-        # 赛前过滤：必须有开赛时间，且在 (0, ENTRY 窗口] 天内
+        # 赛前过滤：必须有开赛时间且在赛前
         cand = bet_cand[bet_cand["days_to_start"].notna()
                         & (bet_cand["days_to_start"] > 0)
                         & (bet_cand["days_to_start"] <= max(C.ENTRY_LEAD_DAYS) + 0.5)]
@@ -235,6 +235,18 @@ def run_scan(verbose=True, dry=False):
         for _, r in cand.iterrows():
             if picked >= min(C.MAX_NEW_BETS_PER_RUN, room):
                 break
+            d2s = float(r["days_to_start"])
+            # ★ 分时点建仓：对每个目标 lead_days（7/3/1），在首次越过该阈值时建一笔。
+            #   这样能同时得到 1/3/7 天三个独立样本，直接满足
+            #   "用预先固定的规则分别评估 1、3、7 天入场" 的要求，
+            #   而不是在事后从同一批注里挑一个时点。
+            target = None
+            for L in sorted(C.ENTRY_LEAD_DAYS, reverse=True):
+                if d2s <= L and d2s > L - 0.5:
+                    target = L
+                    break
+            if target is None:
+                continue
             # 按价格档决定方向
             rule_hit = None
             for lo, hi, sdir, note in C.BET_RULES:
@@ -244,10 +256,9 @@ def run_scan(verbose=True, dry=False):
             if rule_hit is None:
                 continue
             side, note, lo, hi = rule_hit
-            # 同一个 (market, rule) 只下一注
             ex = conn.execute(
-                "SELECT 1 FROM bets WHERE market_id=? AND rule_lo=? AND rule_hi=?",
-                (r["market_id"], lo, hi)).fetchone()
+                "SELECT 1 FROM bets WHERE market_id=? AND rule_lo=? AND rule_hi=?"
+                " AND target_lead=?", (r["market_id"], lo, hi, target)).fetchone()
             if ex:
                 continue
             px = entry_price(r, side)
@@ -258,13 +269,12 @@ def run_scan(verbose=True, dry=False):
             conn.execute(
                 "INSERT INTO bets(market_id,league,question,side,entry_price,entry_mid,"
                 "shares,stake,fee,entry_ts,entry_date,days_to_end,days_to_start,"
-                "game_start,rule_lo,rule_hi,rule_note,event_key,status) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open')",
+                "game_start,rule_lo,rule_hi,rule_note,event_key,target_lead,status) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open')",
                 (r["market_id"], r["league"], r["question"], side, px, r["mid"],
-                 shares, C.STAKE, fee, ts, today, r["days_to_end"], r["days_to_start"],
+                 shares, C.STAKE, fee, ts, today, r["days_to_end"], d2s,
                  r.get("game_start"), lo, hi, note,
-                 # 赛事级聚类键：联赛 + 开赛日（同一场比赛的多个市场共享它）
-                 "%s|%s" % (r["league"], str(r.get("game_start"))[:10])))
+                 "%s|%s" % (r["league"], str(r.get("game_start"))[:10]), target))
             n_bets += 1
             picked += 1
         conn.commit()
