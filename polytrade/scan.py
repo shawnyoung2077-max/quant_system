@@ -73,6 +73,9 @@ def fetch_all_markets(verbose=True, workers=8):
         print("  [scan] 联赛 tag: 抓 %d / 共 %d" % (len(tags), n_all), flush=True)
 
     from concurrent.futures import ThreadPoolExecutor
+    import time as _time
+    _t_start = _time.time()
+    _budget_hit = {"v": False}
 
     def one(item):
         t, nm = item
@@ -81,7 +84,17 @@ def fetch_all_markets(verbose=True, workers=8):
         #   而一个热门联赛可能有 600+ 个未结算市场。某页不足满页即到底，提前停。
         hit_page_cap = False
         failed_page = False
+        skipped_by_budget = False
         for pg in range(max(1, C.MAX_PAGES_PER_TAG)):
+            # ★ 墙钟预算（2026-10-10）：定时任务的 ExecutionTimeLimit 是 30 分钟，
+            #   而 473 个 tag × 10 页最坏情况是 4,730 次请求。一旦代理抽风，
+            #   单次请求要重试 5 次 × 20s 超时 —— 那会把任务拖到被杀。
+            #   所以按墙钟截断，并且**必须上报**（写进 runs.note 交给看门狗）：
+            #   静默截断正是最初那个"联赛覆盖缺陷"能藏两天的原因。
+            if _time.time() - _t_start > C.FETCH_TIME_BUDGET_SEC:
+                _budget_hit["v"] = True
+                skipped_by_budget = True
+                break
             j = _get(C.GAMMA + "/markets",
                      {"limit": C.MARKETS_PER_TAG,
                       "offset": pg * C.MARKETS_PER_TAG,
@@ -96,19 +109,22 @@ def fetch_all_markets(verbose=True, workers=8):
                 break
             if pg == max(1, C.MAX_PAGES_PER_TAG) - 1:
                 hit_page_cap = True
-        return out, hit_page_cap, failed_page
+        return out, hit_page_cap, failed_page, skipped_by_budget
 
     seen = {}
     done = 0
     failed_tags = []
     capped_tags = []
+    skipped_tags = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
         for item, res in zip(tags, ex.map(one, tags)):
-            markets_for_tag, hit_cap, failed_page = res
+            markets_for_tag, hit_cap, failed_page, skipped = res
             if hit_cap:
                 capped_tags.append(item[1])
             if failed_page:
                 failed_tags.append(item[1])
+            if skipped:
+                skipped_tags.append(item[1])
             for k, m, nm in markets_for_tag:
                 if k and k not in seen:
                     m["__league_name"] = nm
@@ -117,6 +133,12 @@ def fetch_all_markets(verbose=True, workers=8):
             if verbose and done % 50 == 0:
                 print("  [scan] tag %d/%d, 累计 %d 个市场"
                       % (done, len(tags), len(seen)), flush=True)
+    if skipped_tags:
+        print("  [scan] ⚠ 墙钟预算 %ds 用尽，%d 个联赛被跳过（覆盖不完整）：%s"
+              % (C.FETCH_TIME_BUDGET_SEC, len(skipped_tags),
+                 ", ".join(skipped_tags[:12])), flush=True)
+        FETCH_COVERAGE_ISSUES.append("time_budget tags_skipped=%d (%s)" %
+                                     (len(skipped_tags), ", ".join(skipped_tags[:12])))
     if capped_tags and verbose:
         print("  [scan] ⚠ %d 个联赛达到 %d 页上限，仍可能有漏采：%s"
               % (len(capped_tags), C.MAX_PAGES_PER_TAG,
