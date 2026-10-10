@@ -25,24 +25,60 @@ from . import db as D
 from .scan import _get, calc_fee
 
 
+def _pick_market(j):
+    """从 gamma 返回值里取出一条 market dict（兼容 list / dict 两种返回）。"""
+    if isinstance(j, list):
+        return j[0] if j else None
+    if isinstance(j, dict) and j.get("id"):
+        return j
+    return None
+
+
 def fetch_resolution(market_id):
-    """返回 (closed: bool, outcome_yes: int|None, raw)。"""
-    j = _get(C.GAMMA + "/markets", {"id": market_id})
+    """
+    返回 (closed: bool, outcome_yes: int|None, raw)。
+
+    ★★★ BUG 修复 2026-10-10 ★★★
+      gamma-api 的 GET /markets?id=<id> **默认只返回未关闭的市场**
+      （等价于隐式 closed=false）。市场一旦结算，这条查询恒返回 []，
+      于是本函数返回 closed=None → settle_bets 把它当成"未到期"，
+      **结算率永远是 0**。
+
+      实测证据（2026-10-10 07:02 UTC，56 笔注的开赛时间已过）：
+        GET /markets?id=5256984               -> []            （空）
+        GET /markets?id=5256984&closed=true   -> 1 条, closed=True, ["0","1"]
+        GET /markets/5256984                  -> 1 条, closed=True, ["0","1"]
+      后果：17 次运行 n_settled 全部为 0，实验一个数据点都拿不到。
+
+      修复：改用路径式 /markets/<id>（不依赖 closed 默认值），
+      并保留两条退路。改完必须回归：settle 后 n_settled 应 ≈ 已开赛注数。
+    """
     m = None
-    if isinstance(j, list) and j:
-        m = j[0]
-    elif isinstance(j, dict) and j.get("id"):
-        m = j
+    for _url, _params in (
+        (C.GAMMA + "/markets/" + str(market_id), None),          # 主路径（推荐）
+        (C.GAMMA + "/markets", {"id": market_id, "closed": "true"}),  # 退路 1
+        (C.GAMMA + "/markets", {"id": market_id}),               # 退路 2（仅未关闭市场）
+    ):
+        try:
+            m = _pick_market(_get(_url, _params))
+        except Exception:
+            m = None
+        if m:
+            break
     if not m:
         return None, None, None
+
     closed = bool(m.get("closed"))
     op = m.get("outcomePrices")
     oy = None
     if closed and op:
         try:
             prices = json.loads(op) if isinstance(op, str) else op
-            # 索引 0 = YES
-            v = float(prices[0])
+            v = float(prices[0])          # 索引 0 = YES
+            # 防误判：作废/取消的市场常返回 ["0.5","0.5"]，
+            # 若按 v>0.5 判则会当成 YES 输 → 凭空造出一笔亏损。必须排除。
+            if abs(v - 0.5) < 1e-6:
+                return closed, None, m     # 已关闭但无明确结果 → 作废，不结算
             oy = 1 if v > 0.5 else 0
         except Exception:
             oy = None

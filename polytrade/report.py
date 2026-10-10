@@ -62,6 +62,65 @@ def calibration_table(df, by, label):
     return pd.DataFrame(rows)
 
 
+def settled_edge_analysis(st):
+    """
+    ★ 2026-10-10 新增：对已结算样本做【去重 + 聚类】的 edge 检验。
+
+    为什么必须做 —— 这是本次最容易骗自己的地方：
+      1) 100 笔纸面注里有 25 笔是**同一市场的重复下注**，其中 24 笔价位完全相同。
+         按笔数直接算 t 值会把有效样本量虚增 ~70%，t 值跟着虚高。
+      2) 同一联赛同一天的比赛高度相关（实测 22/56 笔来自荷乙同一轮）。
+         按笔独立假设算出的标准误是错的，必须按「联赛 x 比赛日」聚类。
+
+    k 的定义：k = 实际胜率 - 市场隐含概率（即每股的期望收益，单位：元/股）。
+    返回 dict，含 naive / 去重 / 聚类 三套 (n, k, se, t)。
+
+    注意：本函数只报「有没有信号」，不代表已经确认 edge。样本量远不够。
+    """
+    if st is None or len(st) == 0:
+        return None
+    d = st.dropna(subset=["entry_price", "outcome_yes"]).copy()
+    if len(d) == 0:
+        return None
+    d["outcome_yes"] = d["outcome_yes"].astype(float)
+    out = {}
+
+    def _k(gr):
+        p = float(gr["entry_price"].mean())
+        o = float(gr["outcome_yes"].mean())
+        return o - p
+
+    # (a) 按笔（错的，仅作对照）
+    n = len(d)
+    out["naive"] = {"n": n, "k": _k(d),
+                    "se": float(d["outcome_yes"].std(ddof=1) / np.sqrt(n))}
+
+    # (b) 按市场去重：同一市场只保留第一笔
+    u = d.sort_values("entry_ts").groupby("market_id", as_index=False).first()
+    nu = len(u)
+    out["per_market"] = {"n": nu, "k": _k(u),
+                         "se": float(u["outcome_yes"].std(ddof=1) / np.sqrt(nu))}
+
+    # (c) 按 联赛 x 比赛日 聚类（簇内先平均，再对簇做 t 检验）
+    uu = u.copy()
+    uu["_day"] = uu["game_start"].astype(str).str[:10]
+    uu["_dev"] = uu["outcome_yes"] - uu["entry_price"]
+    cl = uu.groupby(["league", "_day"])["_dev"].mean()
+    nc = len(cl)
+    if nc >= 2:
+        out["cluster"] = {"n": nc, "k": float(cl.mean()),
+                          "se": float(cl.std(ddof=1) / np.sqrt(nc))}
+
+    for v in out.values():
+        v["t"] = v["k"] / v["se"] if v["se"] and v["se"] > 0 else float("nan")
+        if v["se"] and v["se"] > 0:
+            v["ci"] = (v["k"] - 1.96 * v["se"], v["k"] + 1.96 * v["se"])
+        else:
+            v["ci"] = (float("nan"), float("nan"))
+    out["dup_ratio"] = 1 - nu / n if n else 0.0
+    return out
+
+
 def report(tag="report", verbose=True):
     conn = D.connect()
     obs, bets = load(conn)
@@ -119,6 +178,36 @@ def report(tag="report", verbose=True):
             log("    %-24s n=%-4d 盈亏=$%+8.3f  胜率=%.0f%%"
                 % (str(k)[:24], r["n"], r["pnl"], r["win"] * 100))
 
+        # ---------- ★ 核心：edge 检验（去重 + 聚类） ----------
+        ea = settled_edge_analysis(st)
+        if ea:
+            log("")
+            log("  " + "-" * 92)
+            log("  ★ 核心：k = 实际胜率 - 市场隐含概率   （正 = 买 YES 有 edge）")
+            log("  " + "-" * 92)
+            log("     口径            有效n    k          SE       t      95%CI")
+            for key, lab in (("naive", "按笔(错)"),
+                             ("per_market", "按市场去重"),
+                             ("cluster", "联赛x比赛日聚类")):
+                v = ea.get(key)
+                if not v:
+                    continue
+                log("     %-14s %5d  %+7.4f  %6.4f  %+6.2f  [%+.4f, %+.4f]"
+                    % (lab, v["n"], v["k"], v["se"], v["t"], v["ci"][0], v["ci"][1]))
+            log("")
+            log("     重复下注占比 = %.1f%%（同一市场重复下注，不计入有效样本）"
+                % (ea["dup_ratio"] * 100))
+            pm = ea.get("per_market")
+            if pm and abs(pm["t"]) < 2:
+                log("     ⇒ |t| < 2：**样本量还不够判定 edge 是否存在**，不要据此改策略。")
+            elif pm:
+                log("     ⇒ 注意：这是单一样本、单一周末、少数几个联赛的结果；")
+                log("       若要改策略，先确认它在不同联赛/时段上可复现。")
+            log("")
+            log("     交易成本实测：成交价 - 当时中间价 = 均值 %+.4f 元/股"
+                % float((st["entry_price"] - st["entry_mid"]).mean()))
+            log("       （这是每笔必然付出的成本，必须从 k 里扣掉才算净 edge）")
+
     # ---------------- 校准（核心） ----------------
     log("")
     log("=" * 100)
@@ -153,6 +242,11 @@ def report(tag="report", verbose=True):
     else:
         log("  可用于校准的已结算市场 = %d 个" % len(have))
         log("")
+        log("  ⚠ 口径警告：下面用的价格是**该市场最后一次被观测到的中间价**，")
+        log("    不是决策时刻的价格。已关闭市场不会再被扫描，所以它通常已经接近")
+        log("    赛前最后时刻 —— 信息比我们真正下单时多。这张表只能当**方向性**参考，")
+        log("    不能当成'当时就能赚到的 edge'。可交易口径请看第 1 节的 entry_price。")
+        log("")
         log("  --- 按冷门/热门 ---")
         t = calibration_table(have, "is_cold", "is_cold")
         log(t.to_string(index=False))
@@ -182,13 +276,29 @@ def report(tag="report", verbose=True):
         st["ret"] = st["pnl"] / st["stake"]
         k = float(st["ret"].mean())
         se_k = float(st["ret"].std(ddof=1) / np.sqrt(len(st)))
-        hold = float(st["days_to_end"].fillna(7).mean())
-        n_turn = 365.0 / max(hold, 0.5)
-        log("  ★ 实测（来自 %d 笔已结算纸面交易）:" % len(st))
+        # ★ 2026-10-10 修正：原用 days_to_end（市场到期日）当持有期，
+        #   得到 "n=360 次/年"，把 k*n 放大成天文数字（-16311%），完全没有意义。
+        #   持有期应当 = 结算时刻 - 入场时刻。
+        hold = None
+        try:
+            t0 = pd.to_datetime(st["entry_ts"], errors="coerce", utc=True)
+            t1 = pd.to_datetime(st["settled_ts"], errors="coerce", utc=True)
+            hh = (t1 - t0).dt.total_seconds() / 86400.0
+            hh = hh[(hh > 0) & (hh < 30)]
+            if len(hh):
+                hold = float(hh.mean())
+        except Exception:
+            hold = None
+        if hold is None:
+            hold = float(st["days_to_start"].fillna(1.0).mean()) + 0.25
+        n_turn = 365.0 / max(hold, 0.25)
+        log("  ★ 实测（来自 %d 笔已结算纸面交易，**未去重，仅供参考**）:" % len(st))
         log("     k = 每注净收益率 = %+.4f%%  (SE=%.4f%%, t=%.2f)"
             % (k * 100, se_k * 100, k / se_k if se_k else float("nan")))
-        log("     平均持有期 = %.1f 天  ⇒ n = %.1f 次/年" % (hold, n_turn))
+        log("     平均持有期 = %.2f 天  ⇒ n = %.1f 次/年" % (hold, n_turn))
         log("     k*n = %.1f%%" % (k * n_turn * 100))
+        log("     ⚠ 这里按笔平均且未去重；同一市场重复下注会放大 |k|。")
+        log("       判定 edge 请以上面第 1 节的【按市场去重 / 聚类】口径为准。")
         for rf in (0.04, 0.05):
             ex = k * n_turn - rf
             log("     r_f=%.1f%% ⇒ k*n - r_f = %.1f%%" % (rf * 100, ex * 100))
@@ -218,14 +328,29 @@ def report(tag="report", verbose=True):
     log("=" * 100)
     log("4. 还差什么？")
     log("=" * 100)
-    log("  · 观测市场数: %d（目标：几百个以上才能谈统计显著）" % obs["market_id"].nunique()
-        if len(obs) else "  · 观测市场数: 0")
     if len(obs):
+        log("  · 观测市场数: %d（目标：几百个以上才能谈统计显著）" % obs["market_id"].nunique())
         need = 865
         log("  · 历史研究给出的目标样本量 ≈ %d 个已结算市场" % need)
-        log("  · 按当前节奏，需要累积若干周")
-    log("  · 外部参照价（Pinnacle de-vig）**尚未接入** ——")
-    log("    接入后 ref_fair 列会被填充，届时可做真正的'参照价 vs 市场价'检验")
+
+    # 参照价接入状态（★ 2026-10-10 修正：原文案写死的"尚未接入"已经过期）
+    try:
+        n_ref = int(obs["ref_fair"].notna().sum()) if len(obs) else 0
+    except Exception:
+        n_ref = 0
+    if n_ref > 0:
+        log("  · 外部参照价（Pinnacle de-vig）**已接入** ——")
+        log("    当前有 ref_fair 的观测行 = %d 行，可做'参照价 vs 市场价'检验。" % n_ref)
+        log("    ⚠ 但注意：参照价只在已下注之后才回填，bets 表里 ref_fair 仍是空的，")
+        log("      若要检验'入场时参照价是否也认为便宜'，需要把观测的 ref_fair 回填到 bets。")
+    else:
+        log("  · 外部参照价（Pinnacle de-vig）尚未接入。")
+
+    # 结算健康度（★ 新增：结算失败会让整个实验静默归零）
+    if len(st) == 0 and len(bets):
+        n_started = int((bets["days_to_start"] <= 0).sum()) if "days_to_start" in bets else 0
+        log("  · ⚠ 已结算 0 笔。若已有大量注过了开赛时间，请优先怀疑结算链路，")
+        log("    而不是'比赛还没踢完'。（2026-10-10 就踩过：见 settle.fetch_resolution 注释）")
 
     conn.close()
     return "\n".join(L)

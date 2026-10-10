@@ -62,8 +62,21 @@ def health_check(conn=None, verbose=True):
     if len(scans) >= NO_BET_RUNS:
         recent = scans.head(NO_BET_RUNS)
         if (recent["n_new_bets"].fillna(0) == 0).all():
-            issues.append("[警告] 最近 %d 次扫描都没有新下注 —— "
-                          "可能是筛选条件太严、或规则区间已无市场" % NO_BET_RUNS)
+            # ★ 2026-10-10 修正：先分清"额度满了"还是"筛不出标的"，
+            #   否则会把正常的满仓误报成策略失效。
+            n_open = int(pd.read_sql_query(
+                "SELECT COUNT(*) c FROM bets WHERE status='open'", conn).iloc[0, 0])
+            stats["n_open_bets"] = n_open
+            if n_open >= C.MAX_OPEN_BETS:
+                issues.append(
+                    "[提示] 最近 %d 次扫描没有新下注，因为持仓已满"
+                    "（open=%d / 上限 %d）—— 结算后会自动恢复；"
+                    "若长期不结算请查 settle"
+                    % (NO_BET_RUNS, n_open, C.MAX_OPEN_BETS))
+            else:
+                issues.append("[警告] 最近 %d 次扫描都没有新下注（持仓未满 open=%d/%d）—— "
+                              "可能是筛选条件太严、或规则区间已无市场"
+                              % (NO_BET_RUNS, n_open, C.MAX_OPEN_BETS))
     stats["recent_new_bets"] = (int(scans.head(6)["n_new_bets"].fillna(0).sum())
                                 if not scans.empty else 0)
 

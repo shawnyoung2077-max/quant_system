@@ -271,9 +271,15 @@ def run_scan(verbose=True, dry=False):
             if rule_hit is None:
                 continue
             side, note, lo, hi = rule_hit
+            # ★ BUG 修复 2026-10-10：原判重条件带 target_lead=?，
+            #   而 SQL 里 NULL = 1 结果是 NULL（不为真），于是历史遗留的
+            #   target_lead=NULL 的注永远匹配不上，同一市场被重复下注。
+            #   实测：100 笔里有 25 笔是重复市场，其中 24 笔价位完全相同 —— 纯浪费额度。
+            #   用 COALESCE(...,-1) 归一化 NULL 即可，同时保留 1/3/7 天多时点建仓的设计。
             ex = conn.execute(
                 "SELECT 1 FROM bets WHERE market_id=? AND rule_lo=? AND rule_hi=?"
-                " AND target_lead=?", (r["market_id"], lo, hi, target)).fetchone()
+                " AND COALESCE(target_lead,-1)=COALESCE(?,-1)",
+                (r["market_id"], lo, hi, target)).fetchone()
             if ex:
                 continue
             px = entry_price(r, side)
