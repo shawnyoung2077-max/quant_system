@@ -281,10 +281,18 @@ _WL_CACHE = {}
 
 def load_whitelist():
     """
-    读 modeling/league_support.csv，返回 {归一化联赛名: (supported, n_band)}。
+    读 modeling/league_support.csv，返回 {归一化联赛名: dict}。
 
-    这是双线并行的判据来源：supported=1 表示该联赛在 [0.15,0.30) 档、
-    lead 1/3 天至少 30 个独立市场，且费用调整后通过 bootstrap 区间与 BH 校正。
+    字段：
+        supported  统计显著（聚类 bootstrap 区间下界 > 0 且 BH q < 0.05）
+        n_band     该联赛在 [0.15,0.30) 档、lead 1/3 天的独立市场数
+        net_bias   费用调整后的偏差（未扣实测价差成本）
+
+    ★ 2026-10-10：这里新增 net_bias —— 因为用户要求「限制在偏差较大的时候才交易」，
+      而下注门槛必须是**偏差的量**，不能只用一个 supported 布尔。
+      偏差的分辨率上限是「联赛层」：试过「联赛 x 0.03 价格细档」，
+      356 个单元格里 n>=40 的只有 28 个，BH 校正后显著的一个都没有
+      （见 build_edge_cells.py 的诊断输出）。
     """
     if "wl" in _WL_CACHE:
         return _WL_CACHE["wl"]
@@ -294,23 +302,61 @@ def load_whitelist():
         if os.path.exists(C.WHITELIST_PATH):
             with io.open(C.WHITELIST_PATH, encoding="utf-8") as fh:
                 for row in _csv.DictReader(fh):
+                    def _f(key):
+                        try:
+                            v = row.get(key)
+                            return float(v) if v not in (None, "") else None
+                        except Exception:
+                            return None
                     try:
                         nb = int(row.get("n_band") or 0)
                     except Exception:
                         nb = 0
-                    wl[_norm_league(row.get("league_name"))] = (
-                        int(row.get("supported") or 0), nb)
+                    wl[_norm_league(row.get("league_name"))] = {
+                        "supported": int(row.get("supported") or 0),
+                        "n_band": nb,
+                        "net_bias": _f("bias"),
+                        "q_bh": _f("q_bh"),
+                    }
     except Exception as e:
         print("  [scan] 白名单读取失败（全部按 explore 处理）：%r" % e, flush=True)
     _WL_CACHE["wl"] = wl
     return wl
 
 
-def track_of(league, wl=None):
-    """决定一个市场属于哪条线：有历史证据 -> valid，否则 -> explore。"""
+def league_edge(league, wl=None):
+    """
+    返回该联赛的**净偏差**（已扣手续费与实测价差成本）；
+    **若该联赛没有统计显著的历史证据，返回 None** —— 意思是"估不出来"。
+
+    ★ 2026-10-10 修的一个自己写的坑：
+      第一版只比较 `net_bias >= MIN_EDGE_PP`，忘了同时要求 supported=1。
+      结果 n_band=1 的联赛（只有一个历史市场）会被判成 valid ——
+      比如 "法国超级杯" 单个市场算出 +79.7pp 的"偏差"，
+      那是噪声，不是证据。**在不支持的分辨率上设门槛，等于编一个数字。**
+      所以这里把 supported 当作**存在性**条件，而不是额外的过滤器：
+      偏差只有在能显著估计的地方才存在。
+    """
     wl = load_whitelist() if wl is None else wl
     rec = wl.get(_norm_league(league))
-    return "valid" if (rec and rec[0] == 1) else "explore"
+    if not rec or rec.get("net_bias") is None:
+        return None
+    if rec.get("supported") != 1:
+        return None
+    return float(rec["net_bias"]) - C.SPREAD_COST
+
+
+def track_of(league, wl=None):
+    """
+    决定一个市场属于哪条线。
+
+    ★ 2026-10-10 改：判据从「supported 布尔」改成「净偏差是否过门槛」。
+      用户要求「限制在偏差较大的时候才交易」，所以：
+        valid   = 净偏差 >= MIN_EDGE_PP（可估计且够大）-> 这才是"投资"
+        explore = 偏差估不出来或不够大 -> 只作证据积累，额度极小
+    """
+    e = league_edge(league, wl)
+    return "valid" if (e is not None and e >= C.MIN_EDGE_PP) else "explore"
 
 
 def run_scan(verbose=True, dry=False):
@@ -361,32 +407,59 @@ def run_scan(verbose=True, dry=False):
                 "SELECT COUNT(*) c FROM bets WHERE status='open' AND track=?",
                 (tk,)).fetchone()["c"]
             room[tk] = max(0, cfg["max_open"] - n)
-        if verbose:
-            print("  [scan] 双线额度: " + "  ".join(
-                "%s=%d/%d" % (k, room[k], C.TRACKS[k]["max_open"]) for k in C.TRACKS),
-                flush=True)
 
-        # ★ 风险闸（2026-10-10，用户拍板"稳健不求暴富"）：敞口上限 + 单簇上限
+        # ★ 每日投放上限（2026-10-10 用户明确要求）
+        #   "一天的投资占比不能超过本金的一定比例"
+        #   日盈亏标准差 = 2.24 x sqrt(stake x 日投放)，所以日投放直接决定日波动。
+        #   两条线按 share 切分，避免 explore 吃掉投资线的风险预算。
+        daily_cap = C.MAX_DAILY_NEW_PCT * C.PAPER_BANKROLL
+        daily_used = float(conn.execute(
+            "SELECT COALESCE(SUM(stake),0) s FROM bets WHERE entry_date=?",
+            (today,)).fetchone()["s"] or 0.0)
+        daily_used_track = {}
+        for _r in conn.execute(
+                "SELECT track, COALESCE(SUM(stake),0) s FROM bets "
+                "WHERE entry_date=? GROUP BY track", (today,)):
+            daily_used_track[_r["track"]] = float(_r["s"] or 0.0)
+        daily_room = {}
+        for tk, cfg in C.TRACKS.items():
+            cap = daily_cap * float(cfg.get("share", 1.0))
+            daily_room[tk] = max(0.0, cap - daily_used_track.get(tk, 0.0))
+        daily_room["_all"] = max(0.0, daily_cap - daily_used)
+        if verbose:
+            print("  [scan] 日投放 $%.0f/$%.0f（上限 %.0f%% 本金）  双线: %s"
+                  % (daily_used, daily_cap, C.MAX_DAILY_NEW_PCT * 100,
+                     "  ".join("%s=%d/%d $%.0f"
+                               % (k, room[k], C.TRACKS[k]["max_open"],
+                                  daily_room[k]) for k in C.TRACKS)), flush=True)
+
+        # ★ 风险闸：敞口上限 + 单簇上限
         #   第一轮 100 笔 42 分钟内开完、占用本金 100%，一次坏周末就是 -45%。
         #   56 笔里 22 笔还是荷乙同一轮 —— 那不是 100 个独立头寸。
         #   这两道闸不提高收益，只保证不会被单个周末打穿。
         max_expo = C.MAX_EXPOSURE_PCT * C.PAPER_BANKROLL
         max_clu = C.MAX_CLUSTER_PCT * C.PAPER_BANKROLL
-        expo_room = max(0.0, max_expo - float(conn.execute(
+        expo_used = float(conn.execute(
             "SELECT COALESCE(SUM(stake),0) s FROM bets WHERE status='open'"
-        ).fetchone()["s"] or 0.0))
+        ).fetchone()["s"] or 0.0)
+        expo_room = max(0.0, max_expo - expo_used)
         clu_used = {}
         for _r in conn.execute(
                 "SELECT event_key, COALESCE(SUM(stake),0) s FROM bets "
                 "WHERE status='open' GROUP BY event_key"):
             clu_used[_r["event_key"]] = float(_r["s"] or 0.0)
         if verbose:
-            print("  [scan] 风险闸: 敞口 $%.0f/$%.0f（上限 %.0f%% 本金），"
-                  "单簇上限 $%.0f"
-                  % (max_expo - expo_room, max_expo, C.MAX_EXPOSURE_PCT * 100, max_clu),
+            # ⚠ 这里必须打印**实际占用**，不能写 max_expo - expo_room ——
+            #   超限时 expo_room 会被截到 0，于是永远显示成"刚好用满"，
+            #   把它超了多少藏起来（第一版就犯了这个错）。
+            print("  [scan] 风险闸: 敞口 $%.0f/$%.0f（上限 %.0f%% 本金）%s，单簇上限 $%.0f"
+                  % (expo_used, max_expo, C.MAX_EXPOSURE_PCT * 100,
+                     "  ⚠ 超限" if expo_used > max_expo else "", max_clu),
                   flush=True)
         n_block_expo = 0
         n_block_clu = 0
+        n_block_daily = 0
+        n_block_edge = 0
 
         # 赛前过滤：必须有开赛时间且在赛前
         cand = bet_cand[bet_cand["days_to_start"].notna()
@@ -395,10 +468,16 @@ def run_scan(verbose=True, dry=False):
         cand = cand.sort_values("vol24", ascending=False)
         picked = 0
         n_by_track = {}
+        # ★ 偏差门槛统计（用户要求"限制在偏差较大的时候才交易"）
+        edge_seen = []
         for _, r in cand.iterrows():
             if picked >= C.MAX_NEW_BETS_PER_RUN:
                 break
+            ed = league_edge(r["league"], wl)
+            edge_seen.append(ed)
             track = track_of(r["league"], wl)
+            if track == "explore" and ed is not None:
+                n_block_edge += 1      # 估得出偏差但没到门槛
             if room.get(track, 0) <= 0:
                 continue
             d2s = float(r["days_to_start"])
@@ -439,7 +518,10 @@ def run_scan(verbose=True, dry=False):
             if ex:
                 continue
             # ★ 风险闸检查（放在真正插入之前，保证不会下超）
-            if C.STAKE > expo_room:
+            if C.STAKE > daily_room.get(track, 0.0) or C.STAKE > daily_room["_all"]:
+                n_block_daily += 1
+                continue
+            if C.STAKE > expo_room * C.TRACKS[track].get("share", 1.0):
                 n_block_expo += 1
                 continue
             ekey = "%s|%s" % (r["league"], str(r.get("game_start"))[:10])
@@ -464,6 +546,8 @@ def run_scan(verbose=True, dry=False):
             picked += 1
             room[track] -= 1
             expo_room -= C.STAKE
+            daily_room[track] -= C.STAKE
+            daily_room["_all"] -= C.STAKE
             clu_used[ekey] = clu_used.get(ekey, 0.0) + C.STAKE
             n_by_track[track] = n_by_track.get(track, 0) + 1
         conn.commit()
@@ -471,9 +555,15 @@ def run_scan(verbose=True, dry=False):
             print("  [scan] 新增 %d 笔（%s）"
                   % (n_bets, "  ".join("%s=%d" % kv for kv in sorted(n_by_track.items()))),
                   flush=True)
-        if verbose and (n_block_expo or n_block_clu):
-            print("  [scan] 风险闸拦下: 敞口不足 %d 笔 / 单簇超限 %d 笔"
-                  % (n_block_expo, n_block_clu), flush=True)
+        if verbose and (n_block_daily or n_block_expo or n_block_clu):
+            print("  [scan] 风险闸拦下: 日投放不足 %d / 敞口不足 %d / 单簇超限 %d 笔"
+                  % (n_block_daily, n_block_expo, n_block_clu), flush=True)
+        if verbose:
+            known = [e for e in edge_seen if e is not None]
+            print("  [scan] 偏差门槛: 候选 %d 个，其中 %d 个能估出联赛偏差"
+                  "（%d 个未过 %.0fpp 门槛），%d 个联赛无历史数据"
+                  % (len(edge_seen), len(known), n_block_edge, C.MIN_EDGE_PP * 100,
+                     len(edge_seen) - len(known)), flush=True)
 
     if verbose and not dry:
         # ★ 队列诊断：区分"额度满"和"根本没有标的"，
