@@ -161,6 +161,9 @@ def league_transport_check(st, verbose=True):
         d["_n"] = d["league"].map(norm)
         d["_sup"] = d["_n"].map(lambda x: int(key[x]["supported"]) if x in key else 0)
         d["_nband"] = d["_n"].map(lambda x: int(key[x]["n_band"]) if x in key else 0)
+        # 若 bets 表已有 track 列（双线并行），以它为准；否则按联赛现算。
+        if "track" in d.columns:
+            d["_sup"] = d["track"].map(lambda x: 1 if x == "valid" else 0).fillna(d["_sup"])
 
         out = {}
         for flag, lab in ((1, "有历史支撑"), (0, "无历史支撑")):

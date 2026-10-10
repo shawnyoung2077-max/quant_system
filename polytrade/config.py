@@ -66,8 +66,32 @@ CLOB = "https://clob.polymarket.com"
 SPORTS_CATALOG = os.path.join(
     r"D:\26050\Documents\polymarket_sports\data", "sports_catalog.json")
 
-# 抓取多少个联赛 tag（473 个全抓太慢；按排序取前 N 个 + 冷门优先）
-MAX_LEAGUE_TAGS = 200
+# 抓取多少个联赛 tag。
+# ★★★ 2026-10-10 修正：原值 200 是一个**静默的数据采集缺陷** ★★★
+#   fetch_all_markets 里写的是 tags[:MAX_LEAGUE_TAGS]，也就是
+#   「按 catalog 的原始顺序取前 200 个」。而 catalog 的顺序 ≈ 收录时间，
+#   没有任何优先级含义（ordering 字段只有 home/away，不是排序权重）。
+#
+#   实测 catalog 共 473 个联赛，截前 200 个的后果：
+#     抓到了    UFL、Plunket Shield、National T20 Cup、ECS Switzerland、
+#               Maharani Trophy、JCL T10、Pondicherry PL、NCAA Lacrosse ...
+#     漏掉了    Premier League(#466)、UEFA Europa League(#450)、
+#               MLS(#423)、Serie A(#436)、Liga MX(#223)、A-League Men(#361)、
+#               UFC、NHL、NBA
+#
+#   代价：实盘 100% 押在了证据基础之外的联赛上（Eerste Divisie 历史本档 0 行），
+#   于是测出 k=-11.5pp 时，根本分不清是"策略失效"还是"从来没抓到该抓的联赛"。
+#
+#   现在改为 0 = 抓全部。473 个 tag 约 165 秒，仍在 2 小时周期内。
+MAX_LEAGUE_TAGS = 0
+
+# 每个 tag 翻多少页。
+# ★ 2026-10-10 新增：实测 gamma 的 /markets 单次最多只返回 100 条
+#   （limit=500 与 limit=100 返回完全相同的集合），而 Premier League
+#   一个 tag 就有 600+ 个未结算市场 —— 只取首页等于只看到 1/6。
+#   实测 offset 0~500 能翻出 600 个不同的 PL 市场，所以分页是有效的。
+#   翻页是**按需**的：某一页返回不足 100 条就说明到底了，立即停止。
+MAX_PAGES_PER_TAG = 3
 MARKETS_PER_TAG = 100
 
 # ---------------------------------------------------------------------------
@@ -136,8 +160,32 @@ COLD_QUANTILE = 0.50       # 成交额低于中位的联赛算冷门
 #   本金数字只是为了把 "% of 本金" 读得通顺。
 PAPER_BANKROLL = 3000.0    # 纸面本金（= MAX_OPEN_BETS x STAKE）
 STAKE = 10.0               # 单注金额（固定，便于读 P&L）
-MAX_OPEN_BETS = 300        # 最多同时持有的注数
+MAX_OPEN_BETS = 300        # 最多同时持有的注数（= 两条线额度之和）
 MAX_NEW_BETS_PER_RUN = 25  # 每次扫描最多新增注数
+
+# ---------------------------------------------------------------------------
+# ★ 双线并行（2026-10-10 用户批准）
+# ---------------------------------------------------------------------------
+# 起因：实盘第一轮 k=-11.5pp，但事后查明这些注 100% 押在与历史证据不重叠的
+# 联赛上（Eerste Divisie 在历史本档里 0 行）。于是根本分不清
+# "edge 是假的" 还是 "只是联赛选错了"。两条线分别回答两个问题：
+#
+#   valid   : 只在与历史证据重叠的联赛建仓
+#             -> 回答「历史那个 longshot 偏差，在今天、在这个平台上还成立吗」
+#   explore : 其余联赛
+#             -> 回答「冷门联赛自己有没有独立的机会」
+#
+# 实现方式 = **按联赛分区**（不是同一市场下两注）：
+#   一个市场只会落到其中一条线，避免重复占用额度、也避免样本相关。
+#   两条线规则完全相同，唯一差别是联赛集合 —— 所以可以直接对比。
+#
+# 判定依据是 modeling/league_support.csv（由 build_league_support.py 生成）：
+#   某联赛在 [0.15,0.30) 档、lead 1/3 天的历史样本 n>=30 且 t>2，才进白名单。
+TRACKS = {
+    "valid":   {"max_open": 150},
+    "explore": {"max_open": 150},
+}
+WHITELIST_PATH = os.path.join(ROOT, "modeling", "league_support.csv")
 
 # ---------------------------------------------------------------------------
 # ★ 下注规则（v2：来自建模的干净对照结论，不是我的猜测）

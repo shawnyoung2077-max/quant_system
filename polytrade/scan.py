@@ -11,6 +11,7 @@ scan.py - 扫描 Polymarket，记录观测，并按规则生成纸面下注
 
 import io
 import json
+import os
 import sys
 import time
 import datetime as dt
@@ -58,17 +59,33 @@ def fetch_all_markets(verbose=True, workers=8):
         t = c.get("primaryTagId")
         if t:
             tags.append((t, c.get("name") or c.get("sport") or str(t)))
-    tags = tags[:C.MAX_LEAGUE_TAGS]
+    # ★ MAX_LEAGUE_TAGS = 0 表示「全部」。原先写死 200，
+    #   而 catalog 的顺序没有优先级含义，结果把 Premier League /
+    #   Europa League / MLS / Serie A 等全截掉了（详见 config.py 注释）。
+    n_all = len(tags)
+    if C.MAX_LEAGUE_TAGS:
+        tags = tags[:C.MAX_LEAGUE_TAGS]
+    if verbose:
+        print("  [scan] 联赛 tag: 抓 %d / 共 %d" % (len(tags), n_all), flush=True)
 
     from concurrent.futures import ThreadPoolExecutor
 
     def one(item):
         t, nm = item
-        j = _get(C.GAMMA + "/markets",
-                 {"limit": C.MARKETS_PER_TAG, "closed": "false", "tag_id": t})
-        if not isinstance(j, list):
-            return []
-        return [(m.get("id") or m.get("conditionId"), m, nm) for m in j]
+        out = []
+        # ★ 分页：单次请求最多只返回 100 条（limit=500 与 100 结果相同），
+        #   而一个热门联赛可能有 600+ 个未结算市场。某页不足满页即到底，提前停。
+        for pg in range(max(1, C.MAX_PAGES_PER_TAG)):
+            j = _get(C.GAMMA + "/markets",
+                     {"limit": C.MARKETS_PER_TAG,
+                      "offset": pg * C.MARKETS_PER_TAG,
+                      "closed": "false", "tag_id": t})
+            if not isinstance(j, list) or not j:
+                break
+            out += [(m.get("id") or m.get("conditionId"), m, nm) for m in j]
+            if len(j) < C.MARKETS_PER_TAG:
+                break
+        return out
 
     seen = {}
     done = 0
@@ -198,6 +215,51 @@ def calc_fee(price, shares, fee_rate=None):
     return float(shares * r * price * (1.0 - price))
 
 
+def _norm_league(s):
+    """联赛名归一化：实盘名来自 Polymarket tag，历史名来自数据集，写法有差异。"""
+    s = str(s or "").lower()
+    for ch in " .-_'":
+        s = s.replace(ch, "")
+    return s
+
+
+_WL_CACHE = {}
+
+
+def load_whitelist():
+    """
+    读 modeling/league_support.csv，返回 {归一化联赛名: (supported, n_band)}。
+
+    这是双线并行的判据来源：supported=1 表示该联赛在 [0.15,0.30) 档、
+    lead 1/3 天有 n>=30 且 t>2 的历史样本。
+    """
+    if "wl" in _WL_CACHE:
+        return _WL_CACHE["wl"]
+    wl = {}
+    try:
+        import csv as _csv
+        if os.path.exists(C.WHITELIST_PATH):
+            with io.open(C.WHITELIST_PATH, encoding="utf-8") as fh:
+                for row in _csv.DictReader(fh):
+                    try:
+                        nb = int(row.get("n_band") or 0)
+                    except Exception:
+                        nb = 0
+                    wl[_norm_league(row.get("league_name"))] = (
+                        int(row.get("supported") or 0), nb)
+    except Exception as e:
+        print("  [scan] 白名单读取失败（全部按 explore 处理）：%r" % e, flush=True)
+    _WL_CACHE["wl"] = wl
+    return wl
+
+
+def track_of(league, wl=None):
+    """决定一个市场属于哪条线：有历史证据 -> valid，否则 -> explore。"""
+    wl = load_whitelist() if wl is None else wl
+    rec = wl.get(_norm_league(league))
+    return "valid" if (rec and rec[0] == 1) else "explore"
+
+
 def run_scan(verbose=True, dry=False):
     """主扫描：抓 → 筛 → 写观测 → 建纸面下注。返回统计 dict。"""
     conn = D.connect()
@@ -238,18 +300,31 @@ def run_scan(verbose=True, dry=False):
     # ---- 纸面下注（v3：按价格档规则 + 赛前过滤 + 1/3/7 天分时点建仓）----
     n_bets = 0
     if not dry:
-        open_n = conn.execute(
-            "SELECT COUNT(*) c FROM bets WHERE status='open'").fetchone()["c"]
-        room = max(0, C.MAX_OPEN_BETS - open_n)
+        # ★ 双线并行：按联赛分区（见 config.TRACKS 注释）
+        wl = load_whitelist()
+        room = {}
+        for tk, cfg in C.TRACKS.items():
+            n = conn.execute(
+                "SELECT COUNT(*) c FROM bets WHERE status='open' AND track=?",
+                (tk,)).fetchone()["c"]
+            room[tk] = max(0, cfg["max_open"] - n)
+        if verbose:
+            print("  [scan] 双线额度: " + "  ".join(
+                "%s=%d/%d" % (k, room[k], C.TRACKS[k]["max_open"]) for k in C.TRACKS),
+                flush=True)
         # 赛前过滤：必须有开赛时间且在赛前
         cand = bet_cand[bet_cand["days_to_start"].notna()
                         & (bet_cand["days_to_start"] > 0)
                         & (bet_cand["days_to_start"] <= max(C.ENTRY_LEAD_DAYS) + 0.5)]
         cand = cand.sort_values("vol24", ascending=False)
         picked = 0
+        n_by_track = {}
         for _, r in cand.iterrows():
-            if picked >= min(C.MAX_NEW_BETS_PER_RUN, room):
+            if picked >= C.MAX_NEW_BETS_PER_RUN:
                 break
+            track = track_of(r["league"], wl)
+            if room.get(track, 0) <= 0:
+                continue
             d2s = float(r["days_to_start"])
             # ★ 入场时点归属（2026-10-10 起）：每个市场**只在首次跨过阈值时下一笔**，
             #   该市场就唯一归入 1/3/7 天中的某一档。这样 no-look-ahead：
@@ -295,15 +370,37 @@ def run_scan(verbose=True, dry=False):
             conn.execute(
                 "INSERT INTO bets(market_id,league,question,side,entry_price,entry_mid,"
                 "shares,stake,fee,entry_ts,entry_date,days_to_end,days_to_start,"
-                "game_start,rule_lo,rule_hi,rule_note,event_key,target_lead,status) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open')",
+                "game_start,rule_lo,rule_hi,rule_note,event_key,target_lead,status,track) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open',?)",
                 (r["market_id"], r["league"], r["question"], side, px, r["mid"],
                  shares, C.STAKE, fee, ts, today, r["days_to_end"], d2s,
                  r.get("game_start"), lo, hi, note,
-                 "%s|%s" % (r["league"], str(r.get("game_start"))[:10]), target))
+                 "%s|%s" % (r["league"], str(r.get("game_start"))[:10]), target, track))
             n_bets += 1
             picked += 1
+            room[track] -= 1
+            n_by_track[track] = n_by_track.get(track, 0) + 1
         conn.commit()
+        if verbose and n_bets:
+            print("  [scan] 新增 %d 笔（%s）"
+                  % (n_bets, "  ".join("%s=%d" % kv for kv in sorted(n_by_track.items()))),
+                  flush=True)
+
+    if verbose and not dry:
+        # ★ 队列诊断：区分"额度满"和"根本没有标的"，
+        #   否则实验静默归零时会看起来一切正常（2026-10-10 踩过）。
+        n_inwin = 0
+        try:
+            dd = bet_cand["days_to_start"]
+            for L in sorted(C.ENTRY_LEAD_DAYS, reverse=True):
+                n_inwin += int(((dd <= L) & (dd > L - 0.5)).sum())
+        except Exception:
+            pass
+        print("  [scan] 队列：候选 %d 个，落在 1/3/7 天窗口内的 %d 个，本次新增 %d 笔"
+              % (len(bet_cand), n_inwin, n_bets), flush=True)
+        if n_inwin == 0:
+            print("  [scan] ⚠ 窗口内没有任何候选 —— 不是额度问题，是**没有标的**。"
+                  "请查联赛覆盖（MAX_LEAGUE_TAGS / MAX_PAGES_PER_TAG）", flush=True)
 
     D.log_run(conn, "scan", n_scanned=len(df), n_new_obs=n_obs, n_new_bets=n_bets)
     res = {"scanned": len(df), "obs_candidates": len(obs_cand),
