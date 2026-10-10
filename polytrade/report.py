@@ -13,6 +13,7 @@ report.py - 报告：用观测数据回答核心问题
      k = 每次交易的净收益率, n = 年周转次数, F = 年固定成本, r_f = 无风险利率
 """
 
+import os
 import sys
 import numpy as np
 import pandas as pd
@@ -121,6 +122,69 @@ def settled_edge_analysis(st):
     return out
 
 
+def league_transport_check(st, verbose=True):
+    """
+    ★ 2026-10-10 新增：把实盘结果按「该联赛有没有历史证据支撑」分层。
+
+    起因：实盘第一轮 k = -11.5pp，而当初支撑策略的历史结论是同档 +7.8pp。
+    追下去发现——**证据基础和实盘部署几乎不重叠**：
+
+      历史数据集 74,242 行 / 179 联赛 / 本档 11,239 行，
+      主力是 World Cup(19k行)、LaLiga、NFL、Premier League、Bundesliga；
+      而实盘 32/56 笔押在 Eerste Divisie(历史 8 行, 本档 0 行) 和 Ligue 2(本档 3 行)。
+
+    且历史效应本身高度异质：同档同 lead，联赛间 bias 从 -10.0pp 到 +36.3pp。
+    所以"这一档 +8pp"是对**大联赛/世界杯**成立的平均结论，不能直接搬到荷乙/法乙。
+
+    本函数输出分层后的 k，避免再用一个聚合数字代表所有联赛。
+    """
+    out = None
+    try:
+        sup_path = os.path.join(C.ROOT, "modeling", "league_support.csv")
+        if not os.path.exists(sup_path):
+            if verbose:
+                print("  [分层] 找不到 %s，先跑 build_league_support.py" % sup_path)
+            return None
+        sup = pd.read_csv(sup_path)
+        d = st.dropna(subset=["entry_price", "outcome_yes"]).copy()
+        d["outcome_yes"] = d["outcome_yes"].astype(float)
+        d = d.sort_values("entry_ts").groupby("market_id", as_index=False).first()
+
+        # 联赛名归一化匹配（实盘名来自 Polymarket tag，历史名来自数据集）
+        def norm(s):
+            s = str(s).lower()
+            for ch in " .-_'":
+                s = s.replace(ch, "")
+            return s
+
+        key = {norm(r["league_name"]): r for _, r in sup.iterrows()}
+        d["_n"] = d["league"].map(norm)
+        d["_sup"] = d["_n"].map(lambda x: int(key[x]["supported"]) if x in key else 0)
+        d["_nband"] = d["_n"].map(lambda x: int(key[x]["n_band"]) if x in key else 0)
+
+        out = {}
+        for flag, lab in ((1, "有历史支撑"), (0, "无历史支撑")):
+            g = d[d["_sup"] == flag]
+            if len(g) == 0:
+                continue
+            k = float(g["outcome_yes"].mean() - g["entry_price"].mean())
+            se = float(g["outcome_yes"].std(ddof=1) / np.sqrt(len(g))) if len(g) > 1 else float("nan")
+            out[lab] = {"n": len(g), "k": k, "se": se,
+                        "t": k / se if se and se > 0 else float("nan")}
+        out["_detail"] = d
+        return out
+    except Exception as e:
+        # ★ 不要静默吞掉：这一段跳过会正好藏起最该看的信息
+        #   （2026-10-10 就踩过：os 未导入 -> NameError -> 整段无声消失）
+        print("  [分层] 计算失败（不是'没有数据'，请修）：%r" % e, flush=True)
+        try:
+            import traceback
+            traceback.print_exc()
+        except Exception:
+            pass
+        return None
+
+
 def report(tag="report", verbose=True):
     conn = D.connect()
     obs, bets = load(conn)
@@ -207,6 +271,40 @@ def report(tag="report", verbose=True):
             log("     交易成本实测：成交价 - 当时中间价 = 均值 %+.4f 元/股"
                 % float((st["entry_price"] - st["entry_mid"]).mean()))
             log("       （这是每笔必然付出的成本，必须从 k 里扣掉才算净 edge）")
+
+        # ---------- ★ 证据可迁移性：按联赛历史支撑分层 ----------
+        # ⚠ 注意：这里**不能**写成 `lt.get("有历史支撑")`——
+        #   如果实盘全部押在"无历史支撑"的联赛上（这正是 2026-10-10 的真实情况），
+        #   那个 key 根本不存在，整段会被静默跳过，恰好把最该看的信息藏起来。
+        lt = league_transport_check(st, verbose=verbose)
+        if lt and (lt.get("有历史支撑") or lt.get("无历史支撑")):
+            log("")
+            log("  " + "-" * 92)
+            log("  ★ 证据可迁移性：实盘结果按「该联赛有没有历史证据」分层")
+            log("  " + "-" * 92)
+            for lab in ("有历史支撑", "无历史支撑"):
+                v = lt.get(lab)
+                if not v:
+                    log("     %-10s  n=0" % lab)
+                    continue
+                log("     %-10s  n=%3d   k=%+.4f  SE=%.4f  t=%+.2f"
+                    % (lab, v["n"], v["k"], v["se"], v["t"]))
+            log("")
+            log("     ⚠ 若实盘的钱主要花在「无历史支撑」的联赛上，那么")
+            log("       历史那个 +7~9pp 从来就不是关于这些联赛的结论 ——")
+            log("       这不是策略失效，是**分布外外推**。")
+            log("     ⚠ 历史效应本身异质：同价格档同 lead，联赛间 bias 从 -10pp 到 +36pp，")
+            log("       所以也不该拿一个聚合的 +8pp 当所有联赛的预期。")
+            det = lt.get("_detail")
+            if det is not None and len(det):
+                g = det.groupby("league").agg(n=("market_id", "size"),
+                                              sup=("_sup", "max"),
+                                              nband=("_nband", "max")).sort_values("n", ascending=False)
+                log("     实盘联赛分布（前 10）:")
+                log("       %-34s %5s %10s %10s" % ("联赛", "下注", "有历史支撑", "历史本档n"))
+                for lg, r in g.head(10).iterrows():
+                    log("       %-34s %5d %10s %10d"
+                        % (str(lg)[:32], r["n"], "是" if r["sup"] else "否", r["nband"]))
 
     # ---------------- 校准（核心） ----------------
     log("")

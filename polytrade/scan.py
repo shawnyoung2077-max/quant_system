@@ -251,10 +251,11 @@ def run_scan(verbose=True, dry=False):
             if picked >= min(C.MAX_NEW_BETS_PER_RUN, room):
                 break
             d2s = float(r["days_to_start"])
-            # ★ 分时点建仓：对每个目标 lead_days（7/3/1），在首次越过该阈值时建一笔。
-            #   这样能同时得到 1/3/7 天三个独立样本，直接满足
-            #   "用预先固定的规则分别评估 1、3、7 天入场" 的要求，
-            #   而不是在事后从同一批注里挑一个时点。
+            # ★ 入场时点归属（2026-10-10 起）：每个市场**只在首次跨过阈值时下一笔**，
+            #   该市场就唯一归入 1/3/7 天中的某一档。这样 no-look-ahead：
+            #   分档由预先固定的规则决定，而不是事后从同一批注里挑时点。
+            #   （旧协议会对同一市场在 1/3/7 各下一笔；分析端按 market_id 去重，
+            #     所以两个协议的样本可以合并比较。）
             target = None
             for L in sorted(C.ENTRY_LEAD_DAYS, reverse=True):
                 if d2s <= L and d2s > L - 0.5:
@@ -275,11 +276,15 @@ def run_scan(verbose=True, dry=False):
             #   而 SQL 里 NULL = 1 结果是 NULL（不为真），于是历史遗留的
             #   target_lead=NULL 的注永远匹配不上，同一市场被重复下注。
             #   实测：100 笔里有 25 笔是重复市场，其中 24 笔价位完全相同 —— 纯浪费额度。
-            #   用 COALESCE(...,-1) 归一化 NULL 即可，同时保留 1/3/7 天多时点建仓的设计。
+            #
+            # ★ 协议变更 2026-10-10（用户批准）：判重键**去掉 target_lead**，
+            #   即每个市场只下一笔。原因：我们缺的是独立市场数（决定统计功效），
+            #   同一市场按 1/3/7 天下三笔只是把有效样本摊薄成 1/3，并让 t 值虚高。
+            #   target_lead 仍然记录 —— 它由「首次跨过哪个阈值」唯一决定，
+            #   事后仍可按 1/3/7 天分档比较（分析端按 market_id 去重，口径兼容）。
             ex = conn.execute(
-                "SELECT 1 FROM bets WHERE market_id=? AND rule_lo=? AND rule_hi=?"
-                " AND COALESCE(target_lead,-1)=COALESCE(?,-1)",
-                (r["market_id"], lo, hi, target)).fetchone()
+                "SELECT 1 FROM bets WHERE market_id=? AND rule_lo=? AND rule_hi=?",
+                (r["market_id"], lo, hi)).fetchone()
             if ex:
                 continue
             px = entry_price(r, side)
