@@ -67,6 +67,16 @@ def main():
             out("[3/4] 结算已到期市场 ...")
             n = SE.settle_bets(verbose=True)
             out("      已结算 %d 笔" % n)
+            # ★ 净值快照（2026-10-10 新增）：没有它就无法定义「回撤」。
+            #   必须在结算之后拍 —— 否则已实现盈亏还没更新。
+            try:
+                from . import equity as EQ
+                s = EQ.snapshot()
+                out("      净值 $%.2f（已实现 $%+.2f / 未实现 $%+.2f / 敞口 $%.0f）"
+                    % (s["equity"], s["realized_pnl"], s["unrealized_pnl"],
+                       s["open_stake"]))
+            except Exception as e:
+                out("      净值快照失败: %s" % str(e)[:140])
 
         if not args.scan_only and not args.settle_only:
             out("[4/4] 生成报告 ...")

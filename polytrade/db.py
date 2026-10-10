@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS bets (
     rule_note     TEXT,
     event_key     TEXT,                   -- 赛事级聚类键（联赛|开赛日）
     target_lead   INTEGER,                -- 目标入场时点 7/3/1（分时点评估用）
+    track         TEXT DEFAULT 'explore', -- valid / explore
     ref_fair      REAL,
     edge_at_entry REAL,                   -- 参照公允 - 成交价（YES 口径）
     status        TEXT DEFAULT 'open',    -- open / settled
@@ -88,6 +89,24 @@ CREATE TABLE IF NOT EXISTS runs (
     n_settled   INTEGER,
     note        TEXT
 );
+
+-- 净值曲线（见 equity.py）。没有它就无法定义「回撤」——
+-- 2026-10-10 用户问「第一天怎么回撤 25%」时，系统里连一条净值记录都没有。
+CREATE TABLE IF NOT EXISTS equity (
+    snap_date            TEXT PRIMARY KEY,
+    snap_ts              TEXT,
+    n_open               INTEGER,
+    open_stake           REAL,   -- 在场敞口（也是最大可能损失）
+    cash                 REAL,   -- 本金 + 已实现 - 在场敞口
+    realized_pnl         REAL,
+    unrealized_pnl       REAL,
+    equity               REAL,   -- 本金 + 已实现 + 未实现
+    peak                 REAL,   -- equity 历史最高
+    drawdown             REAL,   -- equity/peak - 1  (<=0)
+    n_unreal_priced      INTEGER,
+    n_unreal_fallback    INTEGER, -- 没有当前报价、用入场价顶替的笔数
+    n_settled            INTEGER
+);
 """
 
 
@@ -96,6 +115,12 @@ def connect(path=None):
     conn = sqlite3.connect(p)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    # Migrate databases created before the dual-track protocol.
+    bet_columns = {row[1] for row in conn.execute("PRAGMA table_info(bets)")}
+    if "track" not in bet_columns:
+        conn.execute("ALTER TABLE bets ADD COLUMN track TEXT DEFAULT 'explore'")
+        conn.execute("UPDATE bets SET track='explore' WHERE track IS NULL")
+        conn.commit()
     return conn
 
 

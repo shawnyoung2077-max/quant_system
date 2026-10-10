@@ -29,6 +29,9 @@ STALE_HOURS = 6.0          # 距上次运行超过这么久 = 任务可能停了
 NO_BET_RUNS = 6            # 连续这么多次运行没下注 = 可疑
 OBS_CHANGE_PCT = 0.5       # 观测数相对上次变动超过 50% = 可疑
 SETTLE_STUCK_DAYS = 4.0    # 有注到期这么久了还是 open = 可疑
+# The 2026-10-10 pagination fix expanded coverage; don't compare its first
+# complete-catalog snapshot with the known truncated snapshot from the day before.
+OBS_COVERAGE_BASELINE_DATE = "2026-10-10"
 
 
 def health_check(conn=None, verbose=True):
@@ -52,7 +55,8 @@ def health_check(conn=None, verbose=True):
         now = dt.datetime.now(dt.timezone.utc)
         hours = (now - last).total_seconds() / 3600 if pd.notna(last) else np.nan
         stats["last_run_hours_ago"] = round(float(hours), 2)
-        stats["n_runs"] = int(len(runs))
+        stats["n_runs"] = int(pd.read_sql_query(
+            "SELECT COUNT(*) c FROM runs", conn).iloc[0, 0])
         if hours > STALE_HOURS:
             issues.append("[严重] 距上次运行 %.1f 小时（阈值 %.0f）—— 任务可能已停止"
                           % (hours, STALE_HOURS))
@@ -80,15 +84,28 @@ def health_check(conn=None, verbose=True):
     stats["recent_new_bets"] = (int(scans.head(6)["n_new_bets"].fillna(0).sum())
                                 if not scans.empty else 0)
 
+    if not scans.empty:
+        last_note = str(scans.iloc[0].get("note") or "")
+        if last_note:
+            # ★ 2026-10-10：这里给 [提示] 而不是 [警告]。
+            #   MAX_PAGES_PER_TAG=10 是**已知且接受的取舍** ——
+            #   实测 53 个联赛会稳定打满（Bundesliga/LaLiga/CS2 ...）。
+            #   如果每轮都报"异常"，告警就变成噪音，人会开始无视它，
+            #   而那正是最初那个"静默少采"能藏两天的土壤。
+            #   真正要报警的是下面第 3 节的观测数突变。
+            issues.append("[提示] 本轮扫描有联赛打满页上限（已知取舍，非故障）：%s"
+                          % last_note)
+
     # ---- 3. 观测数是否异常波动 ----
     obs_today = pd.read_sql_query(
-        "SELECT snap_date, COUNT(*) n FROM observations "
+        "SELECT snap_date, COUNT(DISTINCT market_id) n FROM observations "
         "GROUP BY snap_date ORDER BY snap_date DESC LIMIT 7", conn)
     stats["obs_days"] = len(obs_today)
     if len(obs_today) >= 2:
         cur, prev = int(obs_today.iloc[0]["n"]), int(obs_today.iloc[1]["n"])
         stats["obs_cur"], stats["obs_prev"] = cur, prev
-        if prev > 0:
+        prev_day = str(obs_today.iloc[1]["snap_date"])
+        if prev > 0 and prev_day >= OBS_COVERAGE_BASELINE_DATE:
             chg = abs(cur - prev) / prev
             if chg > OBS_CHANGE_PCT:
                 issues.append("[警告] 观测数从 %d 变到 %d（%.0f%%）—— "
@@ -168,23 +185,54 @@ def daily_digest(conn=None):
       % (st.get("last_run_hours_ago", float("nan")), st.get("n_runs", 0)))
     w("  观测市场数  : %d" % st.get("obs_unique_markets", 0))
     w("  纸面注      : %d 笔 %s" % (st.get("n_bets_total", 0), st.get("bets", {})))
+    b = pd.read_sql_query("SELECT * FROM bets", conn)
+    if not b.empty and "track" in b:
+        w("  双线账本    : " + "  ".join(
+            "%s %d 笔（open %d / settled %d，独立已结算市场 %d）" % (
+                name, len(g), int((g.status == "open").sum()),
+                int((g.status == "settled").sum()),
+                g.loc[g.status == "settled", "market_id"].nunique())
+            for name, g in b.groupby("track", dropna=False)))
     w("  参照价覆盖  : %d 行有 ref_fair" % st.get("ref_fair_rows", 0))
     w("  API 额度    : %s / 500" % st.get("odds_quota_used", "?"))
     w("")
 
     # ---- 纸面盈亏 ----
-    b = pd.read_sql_query("SELECT * FROM bets", conn)
     stt = b[b["status"] == "settled"] if not b.empty else pd.DataFrame()
     w("【纸面盈亏】")
     if len(stt):
         tot = float(stt["pnl"].sum())
-        w("  已结算 %d 笔  总盈亏 $%+.2f（本金的 %.2f%%）"
-          % (len(stt), tot, tot / C.PAPER_BANKROLL * 100))
+        stake_settled = float(stt["stake"].sum())
+        # ★ 2026-10-10 口径修正：原文案写「本金的 x%」，而本金恰好等于全部计划敞口，
+        #   读起来像"回撤"，实际不是。同一笔 $253.62 在本金 1000 / 3000 /
+        #   实际投入 560 下分别是 -25.36% / -8.45% / -45.29%。
+        #   简报里只留**可比的**那个，其余交给详细报告。
+        w("  已结算投入 $%.0f  盈亏 $%+.2f  对已投入资金的收益率 %+.2f%%"
+          % (stake_settled, tot, tot / stake_settled * 100 if stake_settled else 0.0))
         w("  胜率 %.1f%%  平均每注 $%+.4f"
           % ((stt["payout"] > 0).mean() * 100, tot / len(stt)))
-        base = stt["pnl"] / stt["stake"]
-        w("  实测 k（每注净收益率）= %+.4f%%   SE=%.4f%%"
-          % (base.mean() * 100, base.std(ddof=1) / np.sqrt(len(base)) * 100))
+        # 净值与真实回撤（equity 快照）
+        try:
+            from . import equity as EQ
+            s = EQ.compute()
+            md = EQ.max_drawdown()
+            w("  净值 $%.2f（已实现 $%+.2f / 未实现 $%+.2f）  在场敞口 $%.0f（%.1f%% 本金，上限 %.0f%%）"
+              % (s["equity"], s["realized_pnl"], s["unrealized_pnl"],
+                 s["open_stake"], (s["exposure_pct"] or 0) * 100,
+                 C.MAX_EXPOSURE_PCT * 100))
+            if md and md["n_snapshots"] >= 3:
+                w("  最大回撤 %.2f%%（%s → %s）"
+                  % (md["max_drawdown"] * 100, md["peak_date"], md["trough_date"]))
+            else:
+                w("  最大回撤：暂不可测（只有 %d 个快照日，需 >=3）"
+                  % (md["n_snapshots"] if md else 0))
+        except Exception as e:
+            w("  [净值] 计算失败：%r" % e)
+        market = stt.groupby("market_id").agg(pnl=("pnl", "sum"), stake=("stake", "sum"))
+        base = market["pnl"] / market["stake"]
+        se = base.std(ddof=1) / np.sqrt(len(base)) if len(base) > 1 else float("nan")
+        w("  市场级平均净收益率（%d 个独立市场）= %+.4f%%   SE=%.4f%%"
+          % (len(base), base.mean() * 100, se * 100))
     else:
         w("  尚无已结算的注 —— 比赛还没踢完")
         if not b.empty:
@@ -217,14 +265,14 @@ def daily_digest(conn=None):
         w("")
 
     # ---- 距目标还有多远 ----
-    n_set = len(stt)
-    target = 100
+    n_set = int(stt["market_id"].nunique()) if len(stt) else 0
+    target = 100  # initial review checkpoint, not the open-position cap
     w("【进度】")
-    w("  已结算 %d / 目标 %d 笔（%.0f%%）"
+    w("  已结算独立市场 %d / 初步复核点 %d（%.0f%%）"
       % (n_set, target, min(n_set / target * 100, 100)))
     if n_set == 0:
-        w("  说明：目标 100 笔是我设的参考线 —— 到那时 k 的标准误约")
-        w("        为 k 的一半，可以开始判断 edge 真假。")
+        w("  说明：100 个独立市场只是初步复核点；统计结论仍需看区间、")
+        w("        联赛/赛事聚类和 valid 线的独立样本量。")
     w("")
     w("  参照价对照（Pinnacle de-vig vs Polymarket）:")
     m = pd.read_sql_query(

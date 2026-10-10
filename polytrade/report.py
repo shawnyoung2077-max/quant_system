@@ -73,8 +73,8 @@ def settled_edge_analysis(st):
       2) 同一联赛同一天的比赛高度相关（实测 22/56 笔来自荷乙同一轮）。
          按笔独立假设算出的标准误是错的，必须按「联赛 x 比赛日」聚类。
 
-    k 的定义：k = 实际胜率 - 市场隐含概率（即每股的期望收益，单位：元/股）。
-    返回 dict，含 naive / 去重 / 聚类 三套 (n, k, se, t)。
+    k 是买入合约的结果减去实际入场价；YES/NO 按各自合约方向计算。
+    k_net 再扣除实际交易费用。返回 naive / 去重 / 聚类三套统计量。
 
     注意：本函数只报「有没有信号」，不代表已经确认 edge。样本量远不够。
     """
@@ -86,31 +86,36 @@ def settled_edge_analysis(st):
     d["outcome_yes"] = d["outcome_yes"].astype(float)
     out = {}
 
-    def _k(gr):
-        p = float(gr["entry_price"].mean())
-        o = float(gr["outcome_yes"].mean())
-        return o - p
+    d["contract_outcome"] = np.where(
+        d["side"].eq("NO"), 1.0 - d["outcome_yes"], d["outcome_yes"])
+    d["gross_edge"] = d["contract_outcome"] - d["entry_price"]
+    d["net_edge"] = np.where(
+        d["shares"].gt(0) & d["pnl"].notna(), d["pnl"] / d["shares"],
+        d["gross_edge"])
+
+    def _k(gr, col="gross_edge"):
+        return float(gr[col].mean())
 
     # (a) 按笔（错的，仅作对照）
     n = len(d)
-    out["naive"] = {"n": n, "k": _k(d),
-                    "se": float(d["outcome_yes"].std(ddof=1) / np.sqrt(n))}
+    out["naive"] = {"n": n, "k": _k(d), "k_net": _k(d, "net_edge"),
+                    "se": float(d["gross_edge"].std(ddof=1) / np.sqrt(n))}
 
     # (b) 按市场去重：同一市场只保留第一笔
     u = d.sort_values("entry_ts").groupby("market_id", as_index=False).first()
     nu = len(u)
-    out["per_market"] = {"n": nu, "k": _k(u),
-                         "se": float(u["outcome_yes"].std(ddof=1) / np.sqrt(nu))}
+    out["per_market"] = {"n": nu, "k": _k(u), "k_net": _k(u, "net_edge"),
+                         "se": float(u["gross_edge"].std(ddof=1) / np.sqrt(nu))}
 
     # (c) 按 联赛 x 比赛日 聚类（簇内先平均，再对簇做 t 检验）
     uu = u.copy()
     uu["_day"] = uu["game_start"].astype(str).str[:10]
-    uu["_dev"] = uu["outcome_yes"] - uu["entry_price"]
-    cl = uu.groupby(["league", "_day"])["_dev"].mean()
+    cl = uu.groupby(["league", "_day"])[["gross_edge", "net_edge"]].mean()
     nc = len(cl)
     if nc >= 2:
-        out["cluster"] = {"n": nc, "k": float(cl.mean()),
-                          "se": float(cl.std(ddof=1) / np.sqrt(nc))}
+        out["cluster"] = {"n": nc, "k": float(cl["gross_edge"].mean()),
+                          "k_net": float(cl["net_edge"].mean()),
+                          "se": float(cl["gross_edge"].std(ddof=1) / np.sqrt(nc))}
 
     for v in out.values():
         v["t"] = v["k"] / v["se"] if v["se"] and v["se"] > 0 else float("nan")
@@ -220,22 +225,52 @@ def report(tag="report", verbose=True):
         % (len(bets),
            int((bets["status"] == "open").sum()) if len(bets) else 0,
            int((bets["status"] == "settled").sum()) if len(bets) else 0))
+    if len(bets) and "track" in bets:
+        for name, g in bets.groupby("track", dropna=False):
+            settled_g = g[g["status"] == "settled"]
+            log("  %-7s open=%d settled=%d 独立已结算市场=%d" % (
+                str(name), int((g["status"] == "open").sum()), len(settled_g),
+                settled_g["market_id"].nunique()))
 
     # ---------------- 纸面 P&L ----------------
     st = bets[bets["status"] == "settled"] if len(bets) else pd.DataFrame()
     if len(st):
         tot = float(st["pnl"].sum())
+        stake_settled = float(st["stake"].sum())
         log("")
         log("=" * 100)
         log("1. 纸面盈亏")
         log("=" * 100)
+        # ★ 2026-10-10 口径修正：原先只印「总盈亏 / 本金」，而本金恰好等于
+        #   全部计划敞口，于是任何亏损都被报成一个吓人的百分比，被误读成"回撤"。
+        #   同一笔 $253.62：分母填 1000 = -25.36%，填 3000 = -8.45%，
+        #   填实际投入 560 = -45.29% —— 三个数，同样的钱。
+        #   这里把口径并列出来，并指明只有哪个可以和 edge 讨论挂钩。
         log("  本金基准 = $%.0f（单注 $%.0f）" % (C.PAPER_BANKROLL, C.STAKE))
-        log("  已结算 %d 笔，总盈亏 = $%+.2f  (%.2f%% of 本金)"
-            % (len(st), tot, tot / C.PAPER_BANKROLL * 100))
-        log("  胜率 = %.1f%%   平均每注 = $%+.4f"
-            % (float((st["payout"] > 0).mean()) * 100, tot / len(st)))
-        log("  平均投入 = $%.3f   平均回款 = $%.3f"
-            % (float(st["stake"].mean()), float(st["payout"].mean())))
+        log("")
+        log("  【口径必须分清】同一笔亏损在不同分母下差很多：")
+        log("     已结算投入              $%9.2f" % stake_settled)
+        log("     已结算盈亏              $%+9.2f" % tot)
+        log("     ★ 对已投入资金的收益率   %+8.2f%%   <- 只有这个能和 edge 挂钩"
+            % (tot / stake_settled * 100 if stake_settled else 0.0))
+        log("     占名义本金               %+8.2f%%   <- 仅供参考，**不是回撤**"
+            % (tot / C.PAPER_BANKROLL * 100))
+        log("")
+        log("  胜率 = %.1f%%   平均每注 = $%+.4f   平均投入 = $%.3f   平均回款 = $%.3f"
+            % (float((st["payout"] > 0).mean()) * 100, tot / len(st),
+               float(st["stake"].mean()), float(st["payout"].mean())))
+
+        # ---------- ★ 风险与真实回撤（2026-10-10 新增）----------
+        try:
+            from . import equity as EQ
+            log("")
+            log("  " + "-" * 92)
+            log("  ★ 风险与回撤（真实口径，来自 equity 逐日快照）")
+            log("  " + "-" * 92)
+            for _ln in EQ.risk_report().splitlines():
+                log(_ln)
+        except Exception as e:
+            log("  [风险] 计算失败：%r" % e)
         log("")
         log("  按联赛:")
         g = st.groupby("league").agg(n=("pnl", "size"), pnl=("pnl", "sum"),
@@ -250,17 +285,18 @@ def report(tag="report", verbose=True):
         if ea:
             log("")
             log("  " + "-" * 92)
-            log("  ★ 核心：k = 实际胜率 - 市场隐含概率   （正 = 买 YES 有 edge）")
+            log("  ★ 核心：方向收益 = 该合约实际结果 - 入场价（正 = 买入该方向有 edge）")
             log("  " + "-" * 92)
-            log("     口径            有效n    k          SE       t      95%CI")
+            log("     口径            有效n    k(gross)  k(net/share)   SE       t      95%CI")
             for key, lab in (("naive", "按笔(错)"),
                              ("per_market", "按市场去重"),
                              ("cluster", "联赛x比赛日聚类")):
                 v = ea.get(key)
                 if not v:
                     continue
-                log("     %-14s %5d  %+7.4f  %6.4f  %+6.2f  [%+.4f, %+.4f]"
-                    % (lab, v["n"], v["k"], v["se"], v["t"], v["ci"][0], v["ci"][1]))
+                log("     %-14s %5d  %+7.4f   %+7.4f    %6.4f  %+6.2f  [%+.4f, %+.4f]"
+                    % (lab, v["n"], v["k"], v["k_net"], v["se"], v["t"],
+                       v["ci"][0], v["ci"][1]))
             log("")
             log("     重复下注占比 = %.1f%%（同一市场重复下注，不计入有效样本）"
                 % (ea["dup_ratio"] * 100))
@@ -374,16 +410,22 @@ def report(tag="report", verbose=True):
     if len(st):
         # k = 每次交易的净收益率（占投入资金）
         st = st.copy()
-        st["ret"] = st["pnl"] / st["stake"]
-        k = float(st["ret"].mean())
-        se_k = float(st["ret"].std(ddof=1) / np.sqrt(len(st)))
+        # Old protocol could place several tickets on one market. Aggregate
+        # market P&L and stake before estimating the mean return or its SE.
+        st_market = st.groupby("market_id", as_index=False).agg(
+            pnl=("pnl", "sum"), stake=("stake", "sum"),
+            entry_ts=("entry_ts", "min"), settled_ts=("settled_ts", "max"),
+            days_to_start=("days_to_start", "first"))
+        st_market["ret"] = st_market["pnl"] / st_market["stake"]
+        k = float(st_market["ret"].mean())
+        se_k = float(st_market["ret"].std(ddof=1) / np.sqrt(len(st_market)))
         # ★ 2026-10-10 修正：原用 days_to_end（市场到期日）当持有期，
         #   得到 "n=360 次/年"，把 k*n 放大成天文数字（-16311%），完全没有意义。
         #   持有期应当 = 结算时刻 - 入场时刻。
         hold = None
         try:
-            t0 = pd.to_datetime(st["entry_ts"], errors="coerce", utc=True)
-            t1 = pd.to_datetime(st["settled_ts"], errors="coerce", utc=True)
+            t0 = pd.to_datetime(st_market["entry_ts"], errors="coerce", utc=True)
+            t1 = pd.to_datetime(st_market["settled_ts"], errors="coerce", utc=True)
             hh = (t1 - t0).dt.total_seconds() / 86400.0
             hh = hh[(hh > 0) & (hh < 30)]
             if len(hh):
@@ -391,15 +433,15 @@ def report(tag="report", verbose=True):
         except Exception:
             hold = None
         if hold is None:
-            hold = float(st["days_to_start"].fillna(1.0).mean()) + 0.25
+            hold = float(st_market["days_to_start"].fillna(1.0).mean()) + 0.25
         n_turn = 365.0 / max(hold, 0.25)
-        log("  ★ 实测（来自 %d 笔已结算纸面交易，**未去重，仅供参考**）:" % len(st))
+        log("  ★ 实测（按 %d 个独立市场聚合，已结算票数 %d）:" %
+            (len(st_market), len(st)))
         log("     k = 每注净收益率 = %+.4f%%  (SE=%.4f%%, t=%.2f)"
             % (k * 100, se_k * 100, k / se_k if se_k else float("nan")))
         log("     平均持有期 = %.2f 天  ⇒ n = %.1f 次/年" % (hold, n_turn))
         log("     k*n = %.1f%%" % (k * n_turn * 100))
-        log("     ⚠ 这里按笔平均且未去重；同一市场重复下注会放大 |k|。")
-        log("       判定 edge 请以上面第 1 节的【按市场去重 / 聚类】口径为准。")
+        log("     ⚠ 该年化换算仍是小样本方向性展示；判断 edge 请结合聚类区间。")
         for rf in (0.04, 0.05):
             ex = k * n_turn - rf
             log("     r_f=%.1f%% ⇒ k*n - r_f = %.1f%%" % (rf * 100, ex * 100))

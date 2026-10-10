@@ -22,6 +22,8 @@ import pandas as pd
 from . import config as C
 from . import db as D
 
+FETCH_COVERAGE_ISSUES = []
+
 
 def _get(url, params=None, tries=None, timeout=None):
     tries = tries or C.HTTP_RETRIES
@@ -53,6 +55,8 @@ def fetch_all_markets(verbose=True, workers=8):
       （总运行 494 秒）。改成 8 线程并发后约 60 秒。
       其余步骤（转 DataFrame / 筛选）总共只有 13 秒，不值得优化。
     """
+    global FETCH_COVERAGE_ISSUES
+    FETCH_COVERAGE_ISSUES = []
     cat = json.load(io.open(C.SPORTS_CATALOG, encoding="utf-8"))
     tags = []
     for c in cat:
@@ -75,23 +79,37 @@ def fetch_all_markets(verbose=True, workers=8):
         out = []
         # ★ 分页：单次请求最多只返回 100 条（limit=500 与 100 结果相同），
         #   而一个热门联赛可能有 600+ 个未结算市场。某页不足满页即到底，提前停。
+        hit_page_cap = False
+        failed_page = False
         for pg in range(max(1, C.MAX_PAGES_PER_TAG)):
             j = _get(C.GAMMA + "/markets",
                      {"limit": C.MARKETS_PER_TAG,
                       "offset": pg * C.MARKETS_PER_TAG,
                       "closed": "false", "tag_id": t})
-            if not isinstance(j, list) or not j:
+            if not isinstance(j, list):
+                failed_page = True
+                break
+            if not j:
                 break
             out += [(m.get("id") or m.get("conditionId"), m, nm) for m in j]
             if len(j) < C.MARKETS_PER_TAG:
                 break
-        return out
+            if pg == max(1, C.MAX_PAGES_PER_TAG) - 1:
+                hit_page_cap = True
+        return out, hit_page_cap, failed_page
 
     seen = {}
     done = 0
+    failed_tags = []
+    capped_tags = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for res in ex.map(one, tags):
-            for k, m, nm in res:
+        for item, res in zip(tags, ex.map(one, tags)):
+            markets_for_tag, hit_cap, failed_page = res
+            if hit_cap:
+                capped_tags.append(item[1])
+            if failed_page:
+                failed_tags.append(item[1])
+            for k, m, nm in markets_for_tag:
                 if k and k not in seen:
                     m["__league_name"] = nm
                     seen[k] = m
@@ -99,6 +117,19 @@ def fetch_all_markets(verbose=True, workers=8):
             if verbose and done % 50 == 0:
                 print("  [scan] tag %d/%d, 累计 %d 个市场"
                       % (done, len(tags), len(seen)), flush=True)
+    if capped_tags and verbose:
+        print("  [scan] ⚠ %d 个联赛达到 %d 页上限，仍可能有漏采：%s"
+              % (len(capped_tags), C.MAX_PAGES_PER_TAG,
+                 ", ".join(capped_tags[:12])), flush=True)
+    if capped_tags:
+        FETCH_COVERAGE_ISSUES.append("page_cap tags=%d (%s)" %
+                                     (len(capped_tags), ", ".join(capped_tags[:12])))
+    if failed_tags and verbose:
+        print("  [scan] ⚠ %d 个联赛抓取中途遇到 API 错误，覆盖不完整：%s"
+              % (len(failed_tags), ", ".join(failed_tags[:12])), flush=True)
+    if failed_tags:
+        FETCH_COVERAGE_ISSUES.append("api_errors tags=%d (%s)" %
+                                     (len(failed_tags), ", ".join(failed_tags[:12])))
     return list(seen.values())
 
 
@@ -231,7 +262,7 @@ def load_whitelist():
     读 modeling/league_support.csv，返回 {归一化联赛名: (supported, n_band)}。
 
     这是双线并行的判据来源：supported=1 表示该联赛在 [0.15,0.30) 档、
-    lead 1/3 天有 n>=30 且 t>2 的历史样本。
+    lead 1/3 天至少 30 个独立市场，且费用调整后通过 bootstrap 区间与 BH 校正。
     """
     if "wl" in _WL_CACHE:
         return _WL_CACHE["wl"]
@@ -297,7 +328,7 @@ def run_scan(verbose=True, dry=False):
         n_obs += 1
     conn.commit()
 
-    # ---- 纸面下注（v3：按价格档规则 + 赛前过滤 + 1/3/7 天分时点建仓）----
+    # ---- 纸面下注（每市场只下注一次，按首次跨越的 lead 档归类）----
     n_bets = 0
     if not dry:
         # ★ 双线并行：按联赛分区（见 config.TRACKS 注释）
@@ -312,6 +343,29 @@ def run_scan(verbose=True, dry=False):
             print("  [scan] 双线额度: " + "  ".join(
                 "%s=%d/%d" % (k, room[k], C.TRACKS[k]["max_open"]) for k in C.TRACKS),
                 flush=True)
+
+        # ★ 风险闸（2026-10-10，用户拍板"稳健不求暴富"）：敞口上限 + 单簇上限
+        #   第一轮 100 笔 42 分钟内开完、占用本金 100%，一次坏周末就是 -45%。
+        #   56 笔里 22 笔还是荷乙同一轮 —— 那不是 100 个独立头寸。
+        #   这两道闸不提高收益，只保证不会被单个周末打穿。
+        max_expo = C.MAX_EXPOSURE_PCT * C.PAPER_BANKROLL
+        max_clu = C.MAX_CLUSTER_PCT * C.PAPER_BANKROLL
+        expo_room = max(0.0, max_expo - float(conn.execute(
+            "SELECT COALESCE(SUM(stake),0) s FROM bets WHERE status='open'"
+        ).fetchone()["s"] or 0.0))
+        clu_used = {}
+        for _r in conn.execute(
+                "SELECT event_key, COALESCE(SUM(stake),0) s FROM bets "
+                "WHERE status='open' GROUP BY event_key"):
+            clu_used[_r["event_key"]] = float(_r["s"] or 0.0)
+        if verbose:
+            print("  [scan] 风险闸: 敞口 $%.0f/$%.0f（上限 %.0f%% 本金），"
+                  "单簇上限 $%.0f"
+                  % (max_expo - expo_room, max_expo, C.MAX_EXPOSURE_PCT * 100, max_clu),
+                  flush=True)
+        n_block_expo = 0
+        n_block_clu = 0
+
         # 赛前过滤：必须有开赛时间且在赛前
         cand = bet_cand[bet_cand["days_to_start"].notna()
                         & (bet_cand["days_to_start"] > 0)
@@ -362,6 +416,14 @@ def run_scan(verbose=True, dry=False):
                 (r["market_id"], lo, hi)).fetchone()
             if ex:
                 continue
+            # ★ 风险闸检查（放在真正插入之前，保证不会下超）
+            if C.STAKE > expo_room:
+                n_block_expo += 1
+                continue
+            ekey = "%s|%s" % (r["league"], str(r.get("game_start"))[:10])
+            if clu_used.get(ekey, 0.0) + C.STAKE > max_clu:
+                n_block_clu += 1
+                continue
             px = entry_price(r, side)
             if not (0.0 < px < 1.0):
                 continue
@@ -379,12 +441,17 @@ def run_scan(verbose=True, dry=False):
             n_bets += 1
             picked += 1
             room[track] -= 1
+            expo_room -= C.STAKE
+            clu_used[ekey] = clu_used.get(ekey, 0.0) + C.STAKE
             n_by_track[track] = n_by_track.get(track, 0) + 1
         conn.commit()
         if verbose and n_bets:
             print("  [scan] 新增 %d 笔（%s）"
                   % (n_bets, "  ".join("%s=%d" % kv for kv in sorted(n_by_track.items()))),
                   flush=True)
+        if verbose and (n_block_expo or n_block_clu):
+            print("  [scan] 风险闸拦下: 敞口不足 %d 笔 / 单簇超限 %d 笔"
+                  % (n_block_expo, n_block_clu), flush=True)
 
     if verbose and not dry:
         # ★ 队列诊断：区分"额度满"和"根本没有标的"，
@@ -402,7 +469,8 @@ def run_scan(verbose=True, dry=False):
             print("  [scan] ⚠ 窗口内没有任何候选 —— 不是额度问题，是**没有标的**。"
                   "请查联赛覆盖（MAX_LEAGUE_TAGS / MAX_PAGES_PER_TAG）", flush=True)
 
-    D.log_run(conn, "scan", n_scanned=len(df), n_new_obs=n_obs, n_new_bets=n_bets)
+    D.log_run(conn, "scan", n_scanned=len(df), n_new_obs=n_obs, n_new_bets=n_bets,
+              note="; ".join(FETCH_COVERAGE_ISSUES)[:500])
     res = {"scanned": len(df), "obs_candidates": len(obs_cand),
            "bet_candidates": len(bet_cand), "n_cold_leagues": len(cold),
            "n_obs": n_obs, "n_bets": n_bets}
