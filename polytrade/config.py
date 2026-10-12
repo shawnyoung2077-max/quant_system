@@ -49,6 +49,77 @@ if PROXY:
     os.environ.setdefault("no_proxy", "localhost,127.0.0.1,::1")
 
 # ---------------------------------------------------------------------------
+# ★★ 代理自愈（2026-10-12）★★
+# ---------------------------------------------------------------------------
+# 实际事故：Clash Verge 没在跑 → 7897 不监听 → 473 个 tag 全部请求失败。
+# 系统从 10-10 20:45 起整整**静默死了 36 小时**，直到用户问起才发现。
+#
+# 根因不只是网络，而是：Clash Verge 是一个**GUI 程序**，
+# 服务 clash_verge_service 只负责 TUN/提权辅助，**内核 verge-mihomo 是 GUI 拉起来的**。
+# 所以机器重启/注销后，如果没人登录并启动它，代理就一直不在。
+# 而我们的定时任务是在后台跑的，指望不上这一点。
+#
+# 对策：启动时若发现端口没监听，就主动把 Clash Verge 拉起来，并等它把内核带起来。
+# 拉不起来也不吞掉 —— 后面 scan 的预检会抛出明确错误，看门狗也会记录。
+AUTO_START_PROXY = True
+PROXY_EXE_CANDIDATES = [
+    r"C:\Program Files\Clash Verge\clash-verge.exe",
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "clash-verge", "Clash Verge.exe"),
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Clash Verge", "Clash Verge.exe"),
+]
+
+
+def ensure_proxy(wait_sec=45, verbose=True):
+    """
+    确保代理端口在监听。不在就尝试拉起 Clash Verge 并等待内核起来。
+
+    返回最终可用的代理地址（或 None）。会顺便刷新 os.environ，
+    因为 requests 是在请求时才读环境变量的。
+    """
+    global PROXY
+    p = _detect_proxy()
+    if p:
+        PROXY = p
+        return p
+    if not AUTO_START_PROXY:
+        if verbose:
+            print("  [proxy] 7897/7890 均未监听，且 AUTO_START_PROXY=False", flush=True)
+        return None
+
+    exe = next((x for x in PROXY_EXE_CANDIDATES if x and os.path.exists(x)), None)
+    if not exe:
+        if verbose:
+            print("  [proxy] 端口未监听，且找不到 Clash Verge 可执行文件", flush=True)
+        return None
+
+    if verbose:
+        print("  [proxy] 端口未监听 —— 尝试启动 %s 并等待内核就绪（最多 %ds）"
+              % (exe, wait_sec), flush=True)
+    try:
+        import subprocess
+        subprocess.Popen([exe], close_fds=True)
+    except Exception as e:
+        if verbose:
+            print("  [proxy] 启动失败：%r" % e, flush=True)
+        return None
+
+    import time
+    t0 = time.time()
+    while time.time() - t0 < wait_sec:
+        time.sleep(2)
+        p = _detect_proxy()
+        if p:
+            PROXY = p
+            for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+                os.environ[k] = p
+            if verbose:
+                print("  [proxy] 已就绪 %s（等了 %.0f 秒）" % (p, time.time() - t0), flush=True)
+            return p
+    if verbose:
+        print("  [proxy] 启动后 %ds 内仍未监听 —— 可能需要人工登录/选节点" % wait_sec, flush=True)
+    return None
+
+# ---------------------------------------------------------------------------
 # 数据源
 # ---------------------------------------------------------------------------
 DB_PATH = os.path.join(ROOT, "data", "polytrade.sqlite")

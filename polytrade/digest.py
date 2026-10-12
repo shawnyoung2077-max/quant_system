@@ -105,11 +105,23 @@ def health_check(conn=None, verbose=True):
         cur, prev = int(obs_today.iloc[0]["n"]), int(obs_today.iloc[1]["n"])
         stats["obs_cur"], stats["obs_prev"] = cur, prev
         prev_day = str(obs_today.iloc[1]["snap_date"])
-        if prev > 0 and prev_day >= OBS_COVERAGE_BASELINE_DATE:
-            chg = abs(cur - prev) / prev
+        # ★ 2026-10-12 修：原来拿"前一天"直接比，而 10-11 那天系统已经断了
+        #   （代理掉线，只采到 2533 个市场）。10-12 恢复后采到 10812 个，
+        #   于是报"观测数变动 327% —— 可能是 API 结构变化或筛选失效"。
+        #   那是**误报**：真正的异常是前一天太低，不是今天太高。
+        #   改为和近 7 天的中位数比，并且要求两侧都远离中位数才报警。
+        base = float(np.median(obs_today["n"].astype(float)))
+        if prev > 0 and prev_day >= OBS_COVERAGE_BASELINE_DATE and base > 0:
+            chg = abs(cur - base) / base
             if chg > OBS_CHANGE_PCT:
-                issues.append("[警告] 观测数从 %d 变到 %d（%.0f%%）—— "
-                              "可能是 API 结构变化或筛选失效" % (prev, cur, chg * 100))
+                issues.append("[警告] 观测数 %d 偏离近 7 日中位 %.0f 达 %.0f%% —— "
+                              "可能是 API 结构变化或筛选失效"
+                              % (cur, base, chg * 100))
+            elif prev < base * 0.4:
+                issues.append("[提示] 注意：前一日(%s)只采到 %d 个市场，"
+                              "远低于中位 %.0f —— 那天可能已出故障，"
+                              "本日 %d 属恢复正常"
+                              % (prev_day, prev, base, cur))
     stats["obs_unique_markets"] = int(
         pd.read_sql_query("SELECT COUNT(DISTINCT market_id) c FROM observations",
                           conn).iloc[0, 0])

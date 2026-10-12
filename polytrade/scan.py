@@ -57,6 +57,22 @@ def fetch_all_markets(verbose=True, workers=8):
     """
     global FETCH_COVERAGE_ISSUES
     FETCH_COVERAGE_ISSUES = []
+
+    # ★★ 2026-10-12 新增：网络预检，快速失败 ★★
+    #   实际事故：代理（Clash Verge 的 verge-mihomo 内核）没在跑，
+    #   473 个 tag 全部请求失败。旧代码会**傻等满 720 秒墙钟预算**，
+    #   然后返回空 DataFrame，再在 days_to_start 上抛 KeyError ——
+    #   整个 run.py 在第 1 步就崩，第 4 步的报告/看门狗永远不执行，
+    #   结果**系统静默死了 36 小时**，直到用户问起才发现。
+    #   现在先探一次：不可达就立刻抛明确错误，几秒内说清原因。
+    _probe = _get(C.GAMMA + "/markets", {"limit": 1, "closed": "false"},
+                  tries=2, timeout=15)
+    if not isinstance(_probe, list):
+        raise RuntimeError(
+            "Polymarket 不可达（预检失败：%s）。当前 PROXY=%s。"
+            "最常见原因：Clash Verge 没启动 —— 它不跑，7897 端口就不监听。"
+            % (_probe, C.PROXY or "未检测到代理（7897/7890 都未监听）"))
+
     cat = json.load(io.open(C.SPORTS_CATALOG, encoding="utf-8"))
     tags = []
     for c in cat:
@@ -152,6 +168,15 @@ def fetch_all_markets(verbose=True, workers=8):
     if failed_tags:
         FETCH_COVERAGE_ISSUES.append("api_errors tags=%d (%s)" %
                                      (len(failed_tags), ", ".join(failed_tags[:12])))
+    # ★ 抓到一个市场都没有 = 一定是链路/API 出了问题，不是"今天没比赛"。
+    #   这里必须抛错而不是返回空表：空表会让下游在 days_to_start 上抛
+    #   KeyError，把真实原因（网络坏了）掩盖成一个看不懂的 pandas 报错。
+    if not seen:
+        raise RuntimeError(
+            "抓取返回 0 个市场 —— 不是「今天没比赛」，是链路故障。"
+            "失败 tag=%d，达页上限 tag=%d，预算跳过 tag=%d。%s"
+            % (len(failed_tags), len(capped_tags), len(skipped_tags),
+               "; ".join(FETCH_COVERAGE_ISSUES)))
     return list(seen.values())
 
 
