@@ -251,6 +251,31 @@ HIGH_BAND_LO = 0.90
 HIGH_BAND_HI = 0.99
 HIGH_BAND_NET_EDGE_PP = 0.0346
 
+# ---------------------------------------------------------------------------
+# ★ AI 赛前概率预测（2026-10-12 用户要求："每次比赛前调用 AI 分析胜率"）
+# ---------------------------------------------------------------------------
+# 定位：**研究层，不是执行层。**
+#   执行（下注）必须是确定性代码 —— 否则实验的规则就不固定了。
+#   AI 只做一件事：赛前独立给出一个概率，落库，赛后用固定公式评估。
+#
+# 已知的三个风险，全部用数据回答（见 aiforecast.py 顶部注释）：
+#   ① AI 可能只是在复述市场价  -> 用 corr(AI, 市场) 判
+#   ② LLM 校准差，尤其极端概率 -> 用 k_AI 判
+#   ③ AI 的偏离可能纯噪声      -> 用 corr(AI偏离, 结果偏离) 判
+#
+# 额度：宁可少问，不可失控。默认每天最多 150 次。
+AI_FORECAST_ENABLED = True
+AI_MAX_CALLS_PER_RUN = 25
+AI_MAX_CALLS_PER_DAY = 150
+AI_MIN_LEAD_DAYS = 0.25       # 距开赛不足 6 小时不问：答案没用且可能被场边消息污染
+AI_SLEEP_SEC = 0.4            # 每次调用之间的间隔，避免打爆限流
+AI_MAX_TOKENS = 200
+AI_MODEL = "deepseek-chat"
+AI_ENDPOINT = "https://api.deepseek.com/chat/completions"
+# 凭据：先找环境变量 DEEPSEEK_API_KEY，再读下面这个文件里的 refs.DEEPSEEK_API_KEY
+AI_CREDENTIALS_PATH = os.path.join(
+    os.environ.get("USERPROFILE", ""), ".dsh", ".credentials.yaml")
+
 # 距结算天数（观测与下注共用；太近没时间建仓，太远信息不足）
 MIN_DAYS = 0.25
 MAX_DAYS = 14.0

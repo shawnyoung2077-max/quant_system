@@ -22,6 +22,7 @@ def main():
     ap.add_argument("--settle-only", action="store_true")
     ap.add_argument("--report-only", action="store_true")
     ap.add_argument("--dry", action="store_true", help="只写观测，不建纸面下注")
+    ap.add_argument("--no-ai", action="store_true", help="跳过 AI 赛前预测（省额度）")
     ap.add_argument("--no-ref", action="store_true", help="跳过参照价步骤（省额度）")
     args = ap.parse_args()
 
@@ -57,7 +58,7 @@ def main():
             pass
 
         if not args.report_only and not args.scan_only:
-            out("[1/4] 结算已到期市场 ...")
+            out("[1/5] 结算已到期市场 ...")
             n = SE.settle_bets(verbose=True)
             out("      已结算 %d 笔" % n)
             # ★ 净值快照：没有它就无法定义「回撤」。必须在结算之后拍。
@@ -71,7 +72,7 @@ def main():
                 out("      净值快照失败: %s" % str(e)[:140])
 
         if not args.report_only and not args.settle_only:
-            out("[2/4] 扫描 Polymarket ...")
+            out("[2/5] 扫描 Polymarket ...")
             r = SC.run_scan(verbose=True, dry=args.dry)
             out("      %s" % r)
 
@@ -82,7 +83,7 @@ def main():
             try:
                 from . import refodds as RO
                 from . import match as MT
-                out("[3/4] 抓参照价 + 匹配赛程 ...")
+                out("[4/5] 抓参照价 + 匹配赛程 ...")
                 nf = RO.fetch_all(verbose=False)
                 nm, _ = MT.run_match(verbose=False)
                 conn = DB.connect()
@@ -93,8 +94,21 @@ def main():
             except Exception as e:
                 out("      参照价步骤跳过: %s" % str(e)[:140])
 
+        # ★ AI 赛前概率预测（研究层，不影响下注决策）
+        #   下注仍然由确定性代码决定 —— 否则实验规则就不固定了。
+        #   AI 只负责：赛前独立给一个概率、落库、赛后由固定公式评估。
+        if (not args.report_only and not args.settle_only
+                and not args.no_ai and getattr(C, "AI_FORECAST_ENABLED", False)):
+            try:
+                from . import aiforecast as AF
+                out("[3/5] AI 赛前概率预测（落库，不下注）...")
+                r = AF.run(verbose=True)
+                out("      %s" % r)
+            except Exception as e:
+                out("      AI 预测步骤跳过: %s" % str(e)[:160])
+
         if not args.scan_only and not args.settle_only:
-            out("[4/4] 生成报告 ...")
+            out("[5/5] 生成报告 ...")
             txt = RP.report()
             p = RP.save_report(txt, "report_%s.txt" % dt.datetime.now().strftime("%Y%m%d"))
             RP.save_report(txt, "report_latest.txt")

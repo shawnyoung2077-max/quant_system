@@ -557,6 +557,18 @@ def report(tag="report", verbose=True):
     except Exception as e:
         log("        （联赛列表读取失败：%r）" % e)
 
+    # ---------- ★ AI 赛前预测（研究层）----------
+    try:
+        from . import aiforecast as AF
+        log("")
+        log("  " + "-" * 92)
+        log("  ★ AI 赛前概率预测（赛前落库、赛后固定公式评估；不参与下注决策）")
+        log("  " + "-" * 92)
+        for _ln in AF.report_lines(conn):
+            log(_ln)
+    except Exception as e:
+        log("  [AI] 跳过：%r" % e)
+
     conn.close()
     return "\n".join(L)
 
