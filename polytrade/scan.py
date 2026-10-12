@@ -180,6 +180,39 @@ def fetch_all_markets(verbose=True, workers=8):
     return list(seen.values())
 
 
+def _num(v):
+    try:
+        return float(v) if v not in (None, "") else None
+    except Exception:
+        return None
+
+
+def _reward_daily(m):
+    """
+    汇总该市场每天发放的流动性奖励总额。
+
+    clobRewards 形如:
+        [{"rewardsDailyRate": 2, "startDate": "2026-10-11", "endDate": "2500-12-31", ...}]
+    一个市场可能有多个奖励条目（多 token），所以要求和。
+    另有两个配套字段（不在 clobRewards 里，而在 market 顶层）：
+        rewardsMinSize     挂单最少股数
+        rewardsMaxSpread   距中间价多少【分】以内才计入
+    """
+    cr = m.get("clobRewards")
+    if not isinstance(cr, list):
+        return None
+    tot = 0.0
+    got = False
+    for x in cr:
+        if not isinstance(x, dict):
+            continue
+        v = _num(x.get("rewardsDailyRate"))
+        if v is not None:
+            tot += v
+            got = True
+    return tot if got else None
+
+
 def to_frame(markets):
     now = dt.datetime.now(dt.timezone.utc)
     recs = []
@@ -213,6 +246,13 @@ def to_frame(markets):
                 "liq": float(m.get("liquidityNum") or 0),
                 "neg_risk": 1 if m.get("negRisk") else 0,
                 "fee_type": m.get("feeType") or "",
+                # ★ 做市奖励参数（2026-10-12）：纸上做市需要。
+                #   rewardsDailyRate  = 该市场每天发多少奖励
+                #   rewardsMinSize    = 挂单至少要多少股才计入
+                #   rewardsMaxSpread  = 距中间价多少（分）以内才计入
+                "rewards_daily": _reward_daily(m),
+                "rewards_min_size": _num(m.get("rewardsMinSize")),
+                "rewards_max_spread": _num(m.get("rewardsMaxSpread")),
             })
         except Exception:
             continue
@@ -458,6 +498,9 @@ def run_scan(verbose=True, dry=False):
             "liq": r["liq"], "is_cold": int(r["is_cold"]),
             "ref_fair": None, "ref_source": None,
             "neg_risk": int(r["neg_risk"]), "fee_type": r["fee_type"],
+            "rewards_daily": r.get("rewards_daily"),
+            "rewards_min_size": r.get("rewards_min_size"),
+            "rewards_max_spread": r.get("rewards_max_spread"),
         })
         n_obs += 1
     conn.commit()

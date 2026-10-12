@@ -557,6 +557,18 @@ def report(tag="report", verbose=True):
     except Exception as e:
         log("        （联赛列表读取失败：%r）" % e)
 
+    # ---------- ★ 纸上做市（不依赖 edge 验证的独立路径）----------
+    try:
+        from . import papermm as PM
+        log("")
+        log("  " + "-" * 92)
+        log("  ★ 纸上做市评估（提供流动性拿官方奖励）")
+        log("  " + "-" * 92)
+        for _ln in PM.report_lines(conn):
+            log(_ln)
+    except Exception as e:
+        log("  [做市] 跳过：%r" % e)
+
     # ---------- ★ AI 赛前预测（研究层）----------
     try:
         from . import aiforecast as AF

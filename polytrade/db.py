@@ -121,6 +121,15 @@ def connect(path=None):
         conn.execute("ALTER TABLE bets ADD COLUMN track TEXT DEFAULT 'explore'")
         conn.execute("UPDATE bets SET track='explore' WHERE track IS NULL")
         conn.commit()
+    # ★ 2026-10-12 做市奖励字段（纸上做市需要）。三列都必须能空 ——
+    #   历史观测没有这些值，加进来后旧行保持 NULL，不要用默认值假装有数据。
+    obs_cols = {row[1] for row in conn.execute("PRAGMA table_info(observations)")}
+    for col, typ in (("rewards_daily", "REAL"),
+                     ("rewards_min_size", "REAL"),
+                     ("rewards_max_spread", "REAL")):
+        if col not in obs_cols:
+            conn.execute("ALTER TABLE observations ADD COLUMN %s %s" % (col, typ))
+    conn.commit()
     return conn
 
 
@@ -146,7 +155,8 @@ def upsert_observation(conn, row):
             "market_type", "group_title", "bid", "ask", "mid", "spread",
             "days_to_end", "days_to_start", "game_start", "end_date",
             "vol24", "volnum", "liq", "is_cold",
-            "ref_fair", "ref_source", "neg_risk", "fee_type"]
+            "ref_fair", "ref_source", "neg_risk", "fee_type",
+            "rewards_daily", "rewards_min_size", "rewards_max_spread"]
     vals = [row.get(c) for c in cols]
     ph = ",".join("?" * len(cols))
     conn.execute(
@@ -156,5 +166,8 @@ def upsert_observation(conn, row):
         "mid=excluded.mid, spread=excluded.spread, "
         "days_to_end=excluded.days_to_end, days_to_start=excluded.days_to_start, "
         "vol24=excluded.vol24, volnum=excluded.volnum, liq=excluded.liq, "
-        "ref_fair=excluded.ref_fair, ref_source=excluded.ref_source"
+        "ref_fair=excluded.ref_fair, ref_source=excluded.ref_source, "
+        "rewards_daily=excluded.rewards_daily, "
+        "rewards_min_size=excluded.rewards_min_size, "
+        "rewards_max_spread=excluded.rewards_max_spread"
         % (",".join(cols), ph), vals)
