@@ -241,8 +241,11 @@ def filter_candidates(df, verbose=False, wide=False):
     if df.empty:
         return df
     m = df.copy()
-    lo = C.OBS_PRICE_LO if wide else C.BET_PRICE_LO
-    hi = C.OBS_PRICE_HI if wide else C.BET_PRICE_HI
+    # ★ 2026-10-12：下注口径的价格窗口**从 BET_RULES 推导**，不再写死。
+    #   原来硬编码 [0.05, 0.35)，与 BET_RULES 里的 [0.90, 0.99) 冲突，
+    #   导致"买 NO"那条规则永远不可达（183 笔全是 YES）。
+    lo = C.OBS_PRICE_LO if wide else C.BET_PRICE_MIN
+    hi = C.OBS_PRICE_HI if wide else C.BET_PRICE_MAX
     msp = C.OBS_MAX_SPREAD if wide else C.BET_MAX_SPREAD
     types = C.OBS_TYPES if wide else C.BET_TYPES
 
@@ -371,17 +374,55 @@ def league_edge(league, wl=None):
     return float(rec["net_bias"]) - C.SPREAD_COST
 
 
-def track_of(league, wl=None):
+def edge_for(league, mid, wl=None):
+    """
+    按**价格落在哪一档**选择用哪个分辨率的偏差估计。
+
+    ★ 2026-10-12 新增。为什么需要它：
+      低档位 [0.15,0.30) 的证据足够细到**联赛层**（96 个联赛里 26 个 n>=40），
+      高档位 [0.90,0.99) 只够到**档层**（52 个联赛里仅 1 个 n>=40）。
+      两档的支持分辨率不同，所以不能用同一个函数硬套。
+
+    返回 (net_edge, ref_price, level)：
+      net_edge   扣完手续费与实测价差后的净偏差（每股）
+      ref_price  我们实际要付的参考价（用于换算成"每投入 $1 的收益率"）
+      level      "league" / "band" / "none"；none 表示估不出来，不该下注。
+    """
+    if mid is None:
+        return None, None, "none"
+    if C.HIGH_BAND_LO <= mid < C.HIGH_BAND_HI:
+        # 高档位：档层估计（剔除世界杯后 -7.60pp，t=-3.56, n=258）
+        # 买 NO，实付 ≈ 1 - mid（再用 +半价差 的保守估计）
+        ref = max(1e-6, (1.0 - mid) + C.SPREAD_COST)
+        return C.HIGH_BAND_NET_EDGE_PP, ref, "band"
+    e = league_edge(league, wl)
+    if e is None:
+        return None, None, "none"
+    # 低档位：买 YES，实付 ≈ mid
+    return e, max(1e-6, mid), "league"
+
+
+def rel_edge(league, mid, wl=None):
+    """净偏差占实付价的比例（= 每投入 $1 的期望收益）。估不出来返回 None。"""
+    e, ref, _lvl = edge_for(league, mid, wl)
+    if e is None or not ref:
+        return None
+    return e / ref
+
+
+def track_of(league, mid=None, wl=None):
     """
     决定一个市场属于哪条线。
 
-    ★ 2026-10-10 改：判据从「supported 布尔」改成「净偏差是否过门槛」。
-      用户要求「限制在偏差较大的时候才交易」，所以：
-        valid   = 净偏差 >= MIN_EDGE_PP（可估计且够大）-> 这才是"投资"
-        explore = 偏差估不出来或不够大 -> 只作证据积累，额度极小
+    valid   = 偏差可估计，且**占实付价的收益率** >= MIN_EDGE_PCT_OF_STAKE
+    explore = 估不出来或不够大 -> 只作证据积累，额度极小
+
+    ★ 2026-10-12：门槛从绝对 pp 改成相对实付价。
+      理由见 config.MIN_EDGE_PCT_OF_STAKE 的注释 ——
+      高低两档的合约价格差 2.5 倍，用同一个绝对 pp 门槛对小额合约过严。
     """
-    e = league_edge(league, wl)
-    return "valid" if (e is not None and e >= C.MIN_EDGE_PP) else "explore"
+    r = rel_edge(league, mid, wl)
+    return "valid" if (r is not None and r >= C.MIN_EDGE_PCT_OF_STAKE) else "explore"
 
 
 def run_scan(verbose=True, dry=False):
@@ -498,9 +539,9 @@ def run_scan(verbose=True, dry=False):
         for _, r in cand.iterrows():
             if picked >= C.MAX_NEW_BETS_PER_RUN:
                 break
-            ed = league_edge(r["league"], wl)
-            edge_seen.append(ed)
-            track = track_of(r["league"], wl)
+            ed, _ref, _lvl = edge_for(r["league"], r["mid"], wl)
+            edge_seen.append((ed, _lvl))
+            track = track_of(r["league"], r["mid"], wl)
             if track == "explore" and ed is not None:
                 n_block_edge += 1      # 估得出偏差但没到门槛
             if room.get(track, 0) <= 0:
@@ -584,11 +625,16 @@ def run_scan(verbose=True, dry=False):
             print("  [scan] 风险闸拦下: 日投放不足 %d / 敞口不足 %d / 单簇超限 %d 笔"
                   % (n_block_daily, n_block_expo, n_block_clu), flush=True)
         if verbose:
-            known = [e for e in edge_seen if e is not None]
-            print("  [scan] 偏差门槛: 候选 %d 个，其中 %d 个能估出联赛偏差"
-                  "（%d 个未过 %.0fpp 门槛），%d 个联赛无历史数据"
-                  % (len(edge_seen), len(known), n_block_edge, C.MIN_EDGE_PP * 100,
-                     len(edge_seen) - len(known)), flush=True)
+            known = [(e, lv) for e, lv in edge_seen if e is not None]
+            n_lg = sum(1 for _e, lv in known if lv == "league")
+            n_bd = sum(1 for _e, lv in known if lv == "band")
+            print("  [scan] 偏差门槛: 候选 %d 个 —— 能估出偏差的 %d 个"
+                  "（联赛层 %d / 档层 %d）；估不出的 %d 个 -> explore；"
+                  "%d 个估得出但收益率未过 %.0f%%"
+                  % (len(edge_seen), len(known), n_lg, n_bd,
+                     len(edge_seen) - len(known), n_block_edge,
+                     C.MIN_EDGE_PCT_OF_STAKE * 100),
+                  flush=True)
 
     if verbose and not dry:
         # ★ 队列诊断：区分"额度满"和"根本没有标的"，

@@ -499,18 +499,22 @@ def report(tag="report", verbose=True):
     log("=" * 100)
     log("5. 当前生效的交易规则（每次运行都打印，便于事后审计口径）")
     log("=" * 100)
-    log("  选股（什么市场）：价格 ∈ [%.2f, %.2f) 且 价差 <= %.2f"
-        % (C.BET_RULES[0][0], C.BET_RULES[0][1], C.BET_MAX_SPREAD))
+    log("  选股（什么市场）：价格 ∈ [%.2f, %.2f)（**由 BET_RULES 推导**，不再写死）"
+        " 且 价差 <= %.2f"
+        % (C.BET_PRICE_MIN, C.BET_PRICE_MAX, C.BET_MAX_SPREAD))
+    log("  方向规则：%s"
+        % "；".join("[%.2f,%.2f) 买 %s" % (r[0], r[1], r[2]) for r in C.BET_RULES))
     log("  入场时点：只在首次跨过阈值时建一笔，落在 %s 天内（各 0.5 天宽）"
         % " / ".join("(%.1f, %.1f]" % (L - 0.5, L)
                      for L in sorted(C.ENTRY_LEAD_DAYS, reverse=True)))
-    log("  偏差门槛：**只在与历史证据重叠、且净偏差 >= %.0fpp 的联赛建仓**"
-        % (C.MIN_EDGE_PP * 100))
+    log("  偏差门槛：**净偏差占实付价的收益率 >= %.0f%%** 才建仓"
+        % (C.MIN_EDGE_PCT_OF_STAKE * 100))
     log("            净偏差 = 历史 gross_bias - 手续费 0.05xp x(1-p) - 实测价差 %.4f"
         % C.SPREAD_COST)
-    log("            偏差只在【联赛】这一层能估：试过「联赛 x 0.03 价格细档」，")
-    log("            356 个单元格里 n>=40 的仅 28 个，BH 校正后显著的一个都没有")
-    log("            （见 build_edge_cells.py）。再细就是编数字。")
+    log("            用「相对收益率」而非绝对 pp：两档合约价差 2.5 倍")
+    log("            （低档付 ~0.20/股，高档买 NO 只付 ~0.08/股），")
+    log("            同一个绝对 pp 门槛对小额合约过严 —— 那是指标口径错，不是风险偏好。")
+    log("            偏差的分辨率上限：低档位到【联赛】层，高档位只到【档】层")
     log("  仓位：单注 $%.2f  日投放 <= %.0f%% 本金  敞口 <= %.0f%% 本金  单簇 <= %.0f%% 本金"
         % (C.STAKE, C.MAX_DAILY_NEW_PCT * 100, C.MAX_EXPOSURE_PCT * 100,
            C.MAX_CLUSTER_PCT * 100))
@@ -526,16 +530,30 @@ def report(tag="report", verbose=True):
         # ⚠ 要用 track_of（含 MIN_EDGE_PP 门槛），不能用 league_edge is not None ——
         #   后者只表示"能估出偏差"，英超能估但净偏差 +4.5pp 没过 5pp 门槛，
         #   用错了会把英超列进"过关联赛"，与实际下注行为不一致。
-        _ok = [k for k in _wl if _SC.track_of(k, _wl) == "valid"]
+        #   track_of 现在还需要价格（高档位走档层门槛），用该档代表价即可。
+        _ok = [k for k in _wl if _SC.track_of(k, 0.20, _wl) == "valid"]
         _est = [k for k in _wl if _SC.league_edge(k, _wl) is not None]
-        log("        能估出偏差的联赛 %d 个，其中过 %.0fpp 门槛的 %d 个：%s"
-            % (len(_est), C.MIN_EDGE_PP * 100, len(_ok),
+        log("        低档位 [%.2f,%.2f) 买 YES：能估出偏差的联赛 %d 个，"
+            "其中收益率过 %.0f%% 的 %d 个：%s"
+            % (C.BET_RULES[0][0], C.BET_RULES[0][1], len(_est),
+               C.MIN_EDGE_PCT_OF_STAKE * 100, len(_ok),
                ", ".join(sorted(_ok)[:10])))
         if len(_ok) > 10:
             log("        ... 共 %d 个过门槛" % len(_ok))
         _fail = sorted(set(_est) - set(_ok))
         if _fail:
             log("        能估但未过门槛（-> explore）：%s" % ", ".join(_fail))
+        _hb_mid = (C.HIGH_BAND_LO + C.HIGH_BAND_HI) / 2.0
+        _hb_rel = _SC.rel_edge("World Cup", _hb_mid, _wl)
+        log("        高档位 [%.2f,%.2f) 买 NO：偏差只能在**档层**估计"
+            % (C.HIGH_BAND_LO, C.HIGH_BAND_HI))
+        log("          （52 个联赛里仅 1 个 n>=40，联赛层放不下）")
+        log("          档层净偏差 %+.2fpp（剔除世界杯后 -7.60pp, t=-3.56, n=258）"
+            % (C.HIGH_BAND_NET_EDGE_PP * 100))
+        log("          占实付价 %.1f%% -> %s"
+            % ((_hb_rel or 0) * 100,
+               "过门槛，可下注 NO" if (_hb_rel or 0) >= C.MIN_EDGE_PCT_OF_STAKE
+               else "未过 %.0f%% 门槛" % (C.MIN_EDGE_PCT_OF_STAKE * 100)))
     except Exception as e:
         log("        （联赛列表读取失败：%r）" % e)
 
