@@ -53,16 +53,38 @@ except Exception:
 
 
 def load(conn=None):
-    """取所有带奖励的观测（按市场 + 快照时间排序）。"""
+    """
+    取带奖励市场的快照序列。
+
+    ★ 优先用 obs_intraday（小时级）—— 因为 observations 是 (market_id, snap_date)
+      唯一，**同一个市场每天只留一条**，日粒度下一个只活 2 天的市场只有
+      1 个转换点，做市模拟样本根本不够。
+      没有 obs_intraday 时退回 observations，并在报告里注明粒度。
+    """
     own = conn is None
     conn = conn or D.connect()
-    df = pd.read_sql_query(
-        "SELECT market_id, snap_ts, mid, bid, ask, spread, days_to_start, game_start,"
-        " league, question, rewards_daily, rewards_min_size, rewards_max_spread, liq, vol24 "
-        "FROM observations WHERE rewards_daily IS NOT NULL AND rewards_daily > 0 "
-        "AND mid IS NOT NULL ORDER BY market_id, snap_ts", conn)
+    src = "obs_intraday"
+    try:
+        n = conn.execute("SELECT COUNT(*) c FROM obs_intraday").fetchone()["c"]
+        if n == 0:
+            src = "observations"
+    except Exception:
+        src = "observations"
+    if src == "obs_intraday":
+        df = pd.read_sql_query(
+            "SELECT market_id, snap_ts, mid, bid, ask, spread, days_to_start, game_start,"
+            " league, question, rewards_daily, rewards_min_size, rewards_max_spread "
+            "FROM obs_intraday WHERE rewards_daily > 0 AND mid IS NOT NULL "
+            "ORDER BY market_id, snap_ts", conn)
+    else:
+        df = pd.read_sql_query(
+            "SELECT market_id, snap_ts, mid, bid, ask, spread, days_to_start, game_start,"
+            " league, question, rewards_daily, rewards_min_size, rewards_max_spread "
+            "FROM observations WHERE rewards_daily IS NOT NULL AND rewards_daily > 0 "
+            "AND mid IS NOT NULL ORDER BY market_id, snap_ts", conn)
     if own:
         conn.close()
+    df.attrs["src"] = src
     return df
 
 
@@ -173,14 +195,17 @@ def simulate(df, horizons=(1, 3), d_ticks=None):
 def report_lines(conn=None, verbose=False):
     conn = conn or D.connect()
     df = load(conn)
+    src = df.attrs.get("src", "?")
+    unit = "小时级" if src == "obs_intraday" else "日级(退回 observations)"
     L = ["  纸上做市（提供流动性拿官方奖励）—— 不依赖 edge 验证的独立路径"]
     if df.empty:
-        L.append("     还没有带奖励字段的观测。奖励字段是 2026-10-12 才接进来的，")
+        L.append("     还没有带奖励字段的快照。奖励字段是 2026-10-12 才接进来的，")
         L.append("     需要等下一次扫描重新观测市场后才有数据。")
         return L
 
     g = summarize(df)
-    L.append("     覆盖 %d 个市场 / %d 条观测（带奖励的市场）" % (len(g), len(df)))
+    L.append("     数据源 %s（%s），覆盖 %d 个市场 / %d 条快照"
+             % (src, unit, len(g), len(df)))
     L.append("     ① 奖励池：合计 $%.2f/天（中位 $%.2f/市场/天）"
              % (g["rewards_daily"].sum(), g["rewards_daily"].median()))
     L.append("        最大的几个联赛：")
@@ -222,8 +247,8 @@ def report_lines(conn=None, verbose=False):
                             ("%+.3f" % r["mtm_per_share"]) if pd.notna(r["mtm_per_share"]) else "-"))
     else:
         L.append("     ③ 暂时算不了逆向选择：需要同一市场**至少 2 个快照**。")
-        L.append("        奖励字段是 2026-10-12 才接进来的，市场至少要被重新")
-        L.append("        观测两次才有序列。等 4~6 小时后重跑本模块即可。")
+        L.append("        obs_intraday 是 2026-10-12 才建的，等下一次扫描（每 2 小时）")
+        L.append("        写入第二条后，本模块就能开始算。")
     L.append("     ⚠ 这只是可行性初筛。真正的做市需要实时挂撤单，")
     L.append("       我们每 2 小时扫一次，基础设施还差得远。")
     return L

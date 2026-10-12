@@ -505,6 +505,33 @@ def run_scan(verbose=True, dry=False):
         n_obs += 1
     conn.commit()
 
+    # ★ 带奖励市场的【小时级】快照（供纸上做市）。
+    #   observations 是每天一条，做市模拟需要"价格有没有穿过挂单"的细粒度序列，
+    #   日粒度下一个只活 2 天的市场只有 1 个转换点，样本不够。
+    n_intra = 0
+    try:
+        irows = []
+        for _, r in cand.iterrows():
+            rd = r.get("rewards_daily")
+            if rd is None or not (float(rd) > 0):
+                continue
+            irows.append({
+                "market_id": r["market_id"], "snap_ts": ts,
+                "mid": r["mid"], "bid": r["bid"], "ask": r["ask"],
+                "spread": r["spread"], "days_to_start": r["days_to_start"],
+                "game_start": r.get("game_start"), "league": r["league"],
+                "question": r["question"],
+                "rewards_daily": rd,
+                "rewards_min_size": r.get("rewards_min_size"),
+                "rewards_max_spread": r.get("rewards_max_spread"),
+            })
+        n_intra = D.upsert_intraday(conn, irows)
+        if verbose and n_intra:
+            print("  [scan] 做市快照 %d 条（带奖励市场）" % n_intra, flush=True)
+    except Exception as e:
+        if verbose:
+            print("  [scan] 做市快照写入失败（不影响主流程）：%r" % e, flush=True)
+
     # ---- 纸面下注（每市场只下注一次，按首次跨越的 lead 档归类）----
     n_bets = 0
     if not dry:

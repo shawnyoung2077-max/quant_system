@@ -107,6 +107,29 @@ CREATE TABLE IF NOT EXISTS equity (
     n_unreal_fallback    INTEGER, -- 没有当前报价、用入场价顶替的笔数
     n_settled            INTEGER
 );
+
+-- ★ 2026-10-12：带奖励市场的【小时级】快照，专供纸上做市。
+--   为什么不能复用 observations：那张表是 (market_id, snap_date) 唯一的，
+--   **同一个市场每天只留一条** —— 做市模拟需要"价格有没有穿过我们的挂单"，
+--   日粒度下一个只活 2 天的市场只有 1 个转换点，样本根本不够。
+--   这里只记带奖励的市场（当前 ~73 个 x 12 次/天 ≈ 900 行/天），代价可忽略。
+CREATE TABLE IF NOT EXISTS obs_intraday (
+    market_id           TEXT NOT NULL,
+    snap_ts             TEXT NOT NULL,
+    mid                 REAL,
+    bid                 REAL,
+    ask                 REAL,
+    spread              REAL,
+    days_to_start       REAL,
+    game_start          TEXT,
+    league              TEXT,
+    question            TEXT,
+    rewards_daily       REAL,
+    rewards_min_size    REAL,
+    rewards_max_spread  REAL,
+    PRIMARY KEY (market_id, snap_ts)
+);
+CREATE INDEX IF NOT EXISTS idx_oi_market ON obs_intraday(market_id);
 """
 
 
@@ -135,6 +158,24 @@ def connect(path=None):
 
 def now_iso():
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def upsert_intraday(conn, rows):
+    """
+    写小时级快照（只给带奖励的市场，供纸上做市）。
+    rows: list of dict，键见 obs_intraday 表。
+    """
+    if not rows:
+        return 0
+    cols = ["market_id", "snap_ts", "mid", "bid", "ask", "spread",
+            "days_to_start", "game_start", "league", "question",
+            "rewards_daily", "rewards_min_size", "rewards_max_spread"]
+    ph = ",".join("?" * len(cols))
+    conn.executemany(
+        "INSERT OR IGNORE INTO obs_intraday(%s) VALUES(%s)" % (",".join(cols), ph),
+        [[r.get(c) for c in cols] for r in rows])
+    conn.commit()
+    return len(rows)
 
 
 def today():
