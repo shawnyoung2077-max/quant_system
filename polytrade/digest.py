@@ -125,7 +125,21 @@ def health_check(conn=None, verbose=True):
         pd.read_sql_query("SELECT COUNT(DISTINCT market_id) c FROM observations",
                           conn).iloc[0, 0])
 
-    # ---- 4. 结算是否卡住 ----
+    # ---- 5. ★ 数据不变量（2026-10-12 用户指令："每天检查 bug，测试框架别省"）----
+    #   单元测试防"代码写错"，但防不了"线上数据悄悄变质"。
+    #   这一节跑 invariants 的全套检查，坏了会自己冒出来，不需要有人去问。
+    try:
+        from . import invariants as INV
+        # 级别映射成与其它告警一致的中文标签，避免简报里出现英文等级。
+        # FAIL -> 严重（数据/逻辑已坏）；WARN -> 提示（已知或待观察）
+        _LV = {"FAIL": "严重", "WARN": "提示"}
+        for name, level, msg in INV.check_all(conn):
+            issues.append("[%s] 不变量 %s：%s" % (_LV.get(level, level), name, msg))
+        stats["invariants_checked"] = True
+    except Exception as e:
+        issues.append("[警告] 不变量检查自身出错（不是「没数据」，请修）：%r" % e)
+
+    # ---- 6. 结算是否卡住 ----
     b = pd.read_sql_query(
         "SELECT status, COUNT(*) n FROM bets GROUP BY status", conn)
     stats["bets"] = dict(zip(b["status"], b["n"])) if not b.empty else {}
