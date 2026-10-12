@@ -114,24 +114,46 @@ def summarize(df):
     return g
 
 
-def simulate(df, horizons=(1, 3), deltas=(0.005, 0.01, 0.02, 0.045)):
+def simulate(df, horizons=(1, 3), deltas=(0.005, 0.01, 0.02)):
     """
     逆向选择模拟，**按"挂单激进度"扫描**。
 
-    ★ 2026-10-12 修正的建模错误：
-      第一版固定挂在 `mid - rewardsMaxSpread/100`，也就是"离中间价最远、
-      但仍然合格"的位置。那是错的 —— 官方按「越靠近中间价分数越高」分配奖励，
-      所以想拿到有意义的份额**必须贴着中间价挂**，而那正是逆向选择发生的位置。
-      固定在最远处，等于假设我们永远拿最低分，也就永远测不到真实风险。
-
-    现在对每个 delta（= mid - 挂单价）跑一遍，给出权衡曲线：
-        delta 越小 -> 越贴中间价 -> 奖励分越高 -> 但越容易被动成交 -> 逆向选择越重
+    ★ 2026-10-12 修正过的三个坑（每一个都曾把结论带偏）：
+      (1) 固定挂在 `mid - rewardsMaxSpread/100`（离中间价最远但仍合格）是错的：
+          官方按「越靠近中间价分数越高」分配，想拿到份额必须贴着中间价挂，
+          而那正是逆向选择发生的位置。→ 改成扫描 delta。
+      (2) `q = mid - delta` 必须 > 0，delta 越大被排除的市场越多 →
+          不同 delta 落在不同子集，跨档对比变成苹果比橘子。→ 先固定市场集合。
+      (3) ★ 固定集合时把 `dmax` 取成 4.5 分，结果把 rewardsMaxSpread=2.5 的
+          **英超 8 个市场（$925/天的大池子）全排除了** —— 恰好扔掉最重要的样本。
+          → dmax 必须取**所有市场都能支持**的范围。
+          实测：英超 maxspread=2.5，Valorant=4.5，所以公共上限是 2.5 分，
+          默认 delta 上限取 2 分。
 
     成交判据（保守）：若后续快照的 mid <= 挂单价，视为成交。
     真实市场里盘中触发也会成交而我们看不到，所以这必然低估成交量，
     但也因此不会自我美化。
     """
     rows = []
+    dmax = max(deltas)
+    # ★ 固定市场集合再扫：q = mid - delta 必须 > 0.001，delta 越大被排除的市场越多。
+    #   不先做这个过滤，不同 delta 就落在不同子集上 —— 跨档对比变成苹果比橘子。
+    #   第一版就是这样：delta=0.5 时均值池子 $48，delta=4.5 时只有 $4，
+    #   差异来自"被排除的是哪些市场"，不是来自挂单策略。
+    keep = []
+    for k, sub in df.groupby("market_id"):
+        if len(sub) < 2:
+            continue
+        s = sub.sort_values("snap_ts")
+        mid0 = float(s.iloc[0]["mid"])
+        msp = float(s.iloc[0]["rewards_max_spread"] or 4.5) / 100.0
+        # 两个条件都要满足，否则不同 delta 落在不同市场子集上
+        if mid0 > dmax + 0.001 and msp >= dmax:
+            keep.append(k)
+    df = df[df["market_id"].isin(keep)]
+    if df.empty:
+        return pd.DataFrame(), {}
+
     for mid_, sub in df.groupby("market_id"):
         sub = sub.sort_values("snap_ts").reset_index(drop=True)
         if len(sub) < 2:
@@ -183,21 +205,41 @@ def simulate(df, horizons=(1, 3), deltas=(0.005, 0.01, 0.02, 0.045)):
             "fill_rate": float(g["filled"].mean()),
             "at_best_bid_pct": float(g["at_best_bid"].mean()),
             "rest_hours_median": float(g["rest_sec"].median() / 3600.0),
+            # ★ 奖励侧：池子 × 挂单时长占比。这是**独占上界**，
+            #   真实份额还要乘以「我方报价分/全场总分」，而我们看不到总分。
+            #   所以同时给几个份额假设，绝不假装知道真实份额。
+            "reward_pool_daily": float(g["rewards_daily"].mean()),
+            "reward_hours_mean": float((g["rest_sec"] / 3600.0).mean()),
         }
+        row["reward_if_solo_per_cyc"] = \
+            row["reward_pool_daily"] * row["reward_hours_mean"] / 24.0
+        # ★ 风险侧：成交率 × 单次成交损失
         if len(fl):
             row["mtm_per_share_median"] = float(fl["mtm_per_share"].median())
-            # 每次成交的库存损失（每股浮亏 x 股数）
             row["loss_per_fill"] = float((fl["mtm_per_share"] * fl["size"]).mean())
             row["n_filled"] = int(len(fl))
-        # 奖励：按挂单时长占比 × 池子（独占上界），再给份额假设
-        row["reward_pool_daily_sum"] = float(g["rewards_daily"].sum())
+        else:
+            row["loss_per_fill"] = 0.0
+            row["n_filled"] = 0
+        row["loss_per_cyc"] = row["fill_rate"] * row["loss_per_fill"]
+        # ★ 净收益：奖励 − 逆向选择损失。
+        #   ⚠ 符号陷阱：loss_per_fill 与 loss_per_cyc 本身**已经是负数**，
+        #     所以这里必须用 `+`，写成 `-` 就变成把亏损加了上去。
+        #     第一版就是写错成 `− loss_per_cyc`，把净收益整整放大了 10 倍，
+        #     差点得出"做市稳赚"的相反结论。跨档对比时尤其实用。
+        for share in (0.05, 0.10, 0.25, 1.00):
+            row["net_at_%d" % int(share * 100)] = \
+                row["reward_if_solo_per_cyc"] * share + row["loss_per_cyc"]
         by[float(d)] = row
 
     agg = {
         "n_market": int(det["market_id"].nunique()),
         "n_rows": len(det),
         "by_delta": by,
-        "pool_daily_all": float(det[det["delta"] == det["delta"].min()]["rewards_daily"].sum()),
+        "eligible_since_first": True,
+        "pool_daily_all": float(
+            det[det["delta"] == min(by.keys())]["rewards_daily"].sum()
+            if by else 0.0),
     }
     return det, agg
 
@@ -237,29 +279,28 @@ def report_lines(conn=None, verbose=False):
 
     det, agg = simulate(df)
     if agg and agg.get("by_delta"):
-        L.append("     ③ 挂单激进度 vs 逆向选择（权衡曲线）")
-        L.append("        挂单离中间价越近 -> 奖励分越高，但越容易被逆向选中")
-        L.append("        delta  成交率  成为最优买价  单次成交浮亏  %d 个市场"
-                 % agg["n_market"])
+        L.append("     ③ 挂单激进度 vs 逆向选择 vs 奖励（美元/市场/一个挂单周期）")
+        L.append("        挂单越贴中间价 -> 奖励分越高，但越容易被逆向选中")
+        L.append("        delta  成交率  最优买价  单次损失   周期损失 | 奖励(独占) 净@10%% 净@25%%")
         for d in sorted(agg["by_delta"]):
             r = agg["by_delta"][d]
-            lp = r.get("loss_per_fill")
-            L.append("        %5.1f分  %5.1f%%  %9.0f%%  %s"
+            L.append("        %5.1f分  %5.1f%%  %6.0f%%  %8.3f  %8.4f | %8.4f %7.4f %7.4f"
                      % (d * 100, r["fill_rate"] * 100, r["at_best_bid_pct"] * 100,
-                        ("%+.3f 元" % lp) if lp is not None else "   —   "))
-        L.append("        ⚠ 奖励**分成比例算不出来** —— 官方按「我方报价分/全场总分」")
-        L.append("          分配，总分取决于其他做市商挂了多少，我们看不到。")
-        L.append("          所以这一节只给风险侧（成交率 + 逆向选择浮亏），")
-        L.append("          奖励侧只能给池子规模：合计 $%.0f/天（中位 $%.0f/市场/天）"
-                 % (g["rewards_daily"].sum(), g["rewards_daily"].median()))
+                        r["loss_per_fill"], r["loss_per_cyc"],
+                        r["reward_if_solo_per_cyc"],
+                        r["net_at_10"], r["net_at_25"]))
+        L.append("        ⚠ 奖励份额算不出来（官方按「我方报价分/全场总分」分配，")
+        L.append("          总分取决于其他做市商挂了多少，我们看不到）。")
+        L.append("          所以「奖励(独占)」是**上界**，净收益给的是不同份额假设。")
         L.append("        ⚠ 成交率是**下界**：只用 2 小时快照，看不到盘中触发。")
+        L.append("        ★ 判据：净收益在**现实份额**（个位数%）下为正，才值得做。")
         if verbose:
             L.append("        明细（成交的，前 8）:")
             fl = det[det["filled"] == 1].head(8)
             for _, r in fl.iterrows():
-                L.append("          %s delta=%.3f 挂%.4f vs买价%+.4f 最后%.4f 浮亏%+.4f"
+                L.append("          %s d=%.3f 挂%.4f 真实买价%.4f 最后%.4f 浮亏%+.4f"
                          % (str(r["question"])[:30], r["delta"], r["quote"],
-                            r["quote"] - r["bid0"], r["mid_last"], r["mtm_per_share"]))
+                            r["bid0"], r["mid_last"], r["mtm_per_share"]))
     else:
         L.append("     ③ 暂时算不了逆向选择：需要同一市场**至少 2 个快照**。")
         L.append("        obs_intraday 是 2026-10-12 才建的，等下一次扫描（每 2 小时）")
