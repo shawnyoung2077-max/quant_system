@@ -105,23 +105,22 @@ def health_check(conn=None, verbose=True):
         cur, prev = int(obs_today.iloc[0]["n"]), int(obs_today.iloc[1]["n"])
         stats["obs_cur"], stats["obs_prev"] = cur, prev
         prev_day = str(obs_today.iloc[1]["snap_date"])
-        # ★ 2026-10-12 修：原来拿"前一天"直接比，而 10-11 那天系统已经断了
-        #   （代理掉线，只采到 2533 个市场）。10-12 恢复后采到 10812 个，
-        #   于是报"观测数变动 327% —— 可能是 API 结构变化或筛选失效"。
-        #   那是**误报**：真正的异常是前一天太低，不是今天太高。
-        #   改为和近 7 天的中位数比，并且要求两侧都远离中位数才报警。
-        base = float(np.median(obs_today["n"].astype(float)))
-        if prev > 0 and prev_day >= OBS_COVERAGE_BASELINE_DATE and base > 0:
-            chg = abs(cur - base) / base
-            if chg > OBS_CHANGE_PCT:
-                issues.append("[警告] 观测数 %d 偏离近 7 日中位 %.0f 达 %.0f%% —— "
-                              "可能是 API 结构变化或筛选失效"
-                              % (cur, base, chg * 100))
-            elif prev < base * 0.4:
-                issues.append("[提示] 注意：前一日(%s)只采到 %d 个市场，"
-                              "远低于中位 %.0f —— 那天可能已出故障，"
-                              "本日 %d 属恢复正常"
-                              % (prev_day, prev, base, cur))
+        # ★ 2026-10-12 二次修正：语义搞错了方向。
+        #   真正要报警的是**采到的市场数暴跌**（链路坏了 / 筛选失效）；
+        #   数量**暴涨**是恢复，不是异常。
+        #   原来拿"近 7 日中位数"比，而 7 天里有故障日(2533)和首日残缺(1010)，
+        #   中位数被拉低，于是恢复后的 10892 反而被报成"偏离 62%"。
+        #   改成：只和近 7 日的**最高值**比，且只在显著下降时告警。
+        hist = [int(x) for x in obs_today["n"].tolist()[1:]] if len(obs_today) > 1 else []
+        peak = max(hist) if hist else 0
+        if prev > 0 and prev_day >= OBS_COVERAGE_BASELINE_DATE and peak > 0:
+            if cur < peak * 0.5:
+                issues.append("[警告] 观测市场数从峰值 %d 掉到 %d（%.0f%%）—— "
+                              "疑似链路故障或筛选失效" % (peak, cur, cur / peak * 100))
+            elif prev < peak * 0.4:
+                issues.append("[提示] 前一日(%s)只采到 %d 个市场，远低于峰值 %d —— "
+                              "那天很可能出过故障；本日 %d 属恢复正常"
+                              % (prev_day, prev, peak, cur))
     stats["obs_unique_markets"] = int(
         pd.read_sql_query("SELECT COUNT(DISTINCT market_id) c FROM observations",
                           conn).iloc[0, 0])
