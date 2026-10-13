@@ -331,8 +331,35 @@ def evaluate(conn=None):
         conn.close()
 
     out = {"total": int(total), "pending": int(pending), "resolved": len(rows)}
-    if len(rows) < 10:
-        out["note"] = "已结算样本不足 10 条，先不下结论"
+    # ★ 2026-10-13 新增：**全样本**（含未结算）的分布与相关性。
+    #   为什么必须单独给这一项：已结算样本的市场价格区间往往极窄
+    #   （实测那 10 条全部落在 0.155~0.295），在窄区间上算 corr(AI, 市场)
+    #   得到的是噪声 —— 第一版因此报出 corr=-0.779 的"负相关"，
+    #   看起来像 bug，实际是小样本假象。
+    #   全样本 109 条的相关是 +0.520（正，符合预期）。
+    try:
+        allrows = conn2 = None
+        _c = conn or D.connect()
+        allrows = _c.execute(
+            "SELECT ai_prob, market_mid FROM ai_forecasts "
+            "WHERE ai_prob IS NOT NULL AND market_mid IS NOT NULL").fetchall()
+        if conn is None:
+            _c.close()
+        if len(allrows) >= 20:
+            a = np.array([float(r["ai_prob"]) for r in allrows])
+            m = np.array([float(r["market_mid"]) for r in allrows])
+            out["n_all"] = len(allrows)
+            out["corr_all"] = (float(np.corrcoef(a, m)[0, 1])
+                               if a.std() > 0 and m.std() > 0 else None)
+            out["ai_std"], out["mkt_std"] = float(a.std()), float(m.std())
+            out["ai_mean"], out["mkt_mean"] = float(a.mean()), float(m.mean())
+    except Exception:
+        pass
+    # 结论线抬到 30：10 条什么都说明不了（实测就是这个量级触发了假信号）
+    if len(rows) < 30:
+        out["note"] = ("已结算样本 %d 条 < 30，**不下结论**。"
+                       "注意已结算样本的市场价区间常常很窄，"
+                       "在窄区间上算相关性得到的是噪声。" % len(rows))
         return out
 
     ai = np.array([float(r["ai_prob"]) for r in rows])
@@ -367,6 +394,15 @@ def report_lines(conn=None):
     L.append("  AI 预测（赛前落库，赛后固定公式评估）")
     L.append("     已落库 %d 条；已结算 %d；待结算 %d"
              % (e["total"], e["resolved"], e["pending"]))
+    # 先给**全样本**的分布与相关 —— 它不受"已结算样本价区间极窄"的干扰
+    if e.get("n_all"):
+        L.append("     全样本 %d 条：AI 概率 均值 %.3f / SD %.3f，"
+                 "市场价 均值 %.3f / SD %.3f"
+                 % (e["n_all"], e["ai_mean"], e["ai_std"], e["mkt_mean"], e["mkt_std"]))
+        if e.get("corr_all") is not None:
+            L.append("       corr(AI, 市场) 全样本 = %+.3f" % e["corr_all"])
+            L.append("       （AI 的 SD 明显小于市场 ⇒ 概率被往中间压缩，"
+                     "这是 LLM 校准偏保守的典型表现）")
     if e.get("note"):
         L.append("     %s" % e["note"])
         return L

@@ -1,4 +1,4 @@
-"""
+﻿"""
 papermm.py —— 纸上做市（提供流动性拿官方奖励）的可行性评估
 ============================================================================
 为什么单独做这个模块：
@@ -222,11 +222,19 @@ def simulate(df, horizons=(1, 3), deltas=(0.005, 0.01, 0.02)):
             row["loss_per_fill"] = 0.0
             row["n_filled"] = 0
         row["loss_per_cyc"] = row["fill_rate"] * row["loss_per_fill"]
+        # ★ 保本份额：要拿到奖励池的多大比例才能不亏。
+        #   这是**唯一不受「份额未知」影响的决策指标** —— 份额由别的做市商决定，
+        #   我们看不见；但「我需要多少份额才保本」完全由我们自己的
+        #   成交率和逆向选择决定，所以它是可算、可比较、可下判断的。
+        #   把结论写成"净@5%"是有误导性的：5% 这个数从哪来？没人知道。
+        row["breakeven_share"] = (
+            abs(row["loss_per_cyc"]) / row["reward_if_solo_per_cyc"]
+            if row["reward_if_solo_per_cyc"] > 0 else float("inf"))
         # ★ 净收益：奖励 − 逆向选择损失。
         #   ⚠ 符号陷阱：loss_per_fill 与 loss_per_cyc 本身**已经是负数**，
         #     所以这里必须用 `+`，写成 `-` 就变成把亏损加了上去。
         #     第一版就是写错成 `− loss_per_cyc`，把净收益整整放大了 10 倍，
-        #     差点得出"做市稳赚"的相反结论。跨档对比时尤其实用。
+        #     差点得出"做市稳赚"的相反结论。
         for share in (0.05, 0.10, 0.25, 1.00):
             row["net_at_%d" % int(share * 100)] = \
                 row["reward_if_solo_per_cyc"] * share + row["loss_per_cyc"]
@@ -279,19 +287,25 @@ def report_lines(conn=None, verbose=False):
 
     det, agg = simulate(df)
     if agg and agg.get("by_delta"):
-        L.append("     ③ 挂单激进度 vs 逆向选择 vs 奖励（美元/市场/一个挂单周期）")
+        L.append("     ③ 挂单激进度 vs 逆向选择（美元/市场/一个挂单周期）")
         L.append("        挂单越贴中间价 -> 奖励分越高，但越容易被逆向选中")
-        L.append("        delta  成交率  最优买价  单次损失   周期损失 | 奖励(独占) 净@10%% 净@25%%")
+        L.append("        %-6s %7s %8s %10s %10s | %11s %12s"
+                 % ("delta", "成交率", "最优买价", "单次损失", "周期损失",
+                    "奖励(独占上界)", "★保本份额"))
         for d in sorted(agg["by_delta"]):
             r = agg["by_delta"][d]
-            L.append("        %5.1f分  %5.1f%%  %6.0f%%  %8.3f  %8.4f | %8.4f %7.4f %7.4f"
-                     % (d * 100, r["fill_rate"] * 100, r["at_best_bid_pct"] * 100,
-                        r["loss_per_fill"], r["loss_per_cyc"],
-                        r["reward_if_solo_per_cyc"],
-                        r["net_at_10"], r["net_at_25"]))
-        L.append("        ⚠ 奖励份额算不出来（官方按「我方报价分/全场总分」分配，")
-        L.append("          总分取决于其他做市商挂了多少，我们看不到）。")
-        L.append("          所以「奖励(独占)」是**上界**，净收益给的是不同份额假设。")
+            be = r["breakeven_share"]
+            L.append("        %-6s %6.1f%% %7.0f%% %10.3f %10.4f | %11.4f %11s"
+                     % ("%.1f分" % (d * 100), r["fill_rate"] * 100,
+                        r["at_best_bid_pct"] * 100, r["loss_per_fill"],
+                        r["loss_per_cyc"], r["reward_if_solo_per_cyc"],
+                        ("%.2f%%" % (be * 100)) if be != float("inf") else "∞"))
+        L.append("        ★ 保本份额 = 周期损失 / 奖励独占上界。")
+        L.append("          这是**唯一不受「份额未知」影响的指标** —— 份额由别的做市商")
+        L.append("          决定、我们看不见；但「我需要多少份额才保本」完全由")
+        L.append("          我们自己的成交率和逆向选择决定，所以可算可比。")
+        L.append("          判断标准：现实份额（个位数%）明显高于保本份额 -> 值得做。")
+        L.append("        ⚠ 「奖励(独占上界)」按 挂单时长 × 池子 估算，是 100% 份额。")
         L.append("        ⚠ 成交率是**下界**：只用 2 小时快照，看不到盘中触发。")
         L.append("        ★ 判据：净收益在**现实份额**（个位数%）下为正，才值得做。")
         if verbose:
