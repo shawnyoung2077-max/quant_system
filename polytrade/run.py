@@ -126,16 +126,25 @@ def main():
         # 且只抓「Polymarket 有对应市场」的联赛 ⇒ 约 150 次/月（预算 400）。
         # 失败不影响主流程（参照价是增强项，不是必需项）。
         if (not args.report_only and not args.settle_only and not args.no_ref
-                and have_budget(180, "参照价+匹配赛程")):
+                and have_budget(120, "参照价+匹配赛程")):
             try:
                 from . import refodds as RO
                 from . import match as MT
                 out("[4/5] 抓参照价 + 匹配赛程 ...")
-                # ★ 本步骤也要能吃预算截断 —— 它就是那次硬杀的真凶。
-                ref_budget = max(60.0, budget_left() - C.RUN_RESERVE_SEC - 60.0)
-                out("      参照价预算 %.0fs（剩余 %.0fs）" % (ref_budget, budget_left()))
-                nf = RO.fetch_all(verbose=True, budget_sec=ref_budget)
-                nm, _ = MT.run_match(verbose=False)
+                # ★ 本步骤曾经把整轮运行拖死（实测跑了 1100s，预算是 655s），
+                #   而且内部一句都不打印，外部看起来就是卡死。
+                #   现在两层约束：步骤有自己的上限 REFODDS_MAX_SEC，
+                #   且抓取与匹配各自还要能吃到子预算。
+                step_budget = max(90.0, min(C.REFODDS_MAX_SEC,
+                                            budget_left() - C.RUN_RESERVE_SEC - 90.0))
+                out("      本步预算 %.0fs（整轮剩余 %.0fs，上限 %ds）"
+                    % (step_budget, budget_left(), C.REFODDS_MAX_SEC))
+                t_step = _time.time()
+                nf = RO.fetch_all(verbose=True,
+                                  budget_sec=max(60.0, step_budget * 0.4))
+                match_budget = max(30.0, step_budget - (_time.time() - t_step))
+                out("      匹配赛程预算 %.0fs" % match_budget)
+                nm, _ = MT.run_match(verbose=True, budget_sec=match_budget)
                 conn = DB.connect()
                 filled = RO.fill_ref_fair(conn)
                 conn.close()

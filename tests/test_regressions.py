@@ -393,14 +393,20 @@ class TestRunWallClockBudget(unittest.TestCase):
     """
 
     def test_budget_fits_inside_the_hard_task_limit(self):
-        """★ 最关键的一条：预算必须留在 PT30M(=1800s) 以内。"""
+        """
+        ★ 最关键的一条：整轮预算 + 保留额必须留在 PT30M(=1800s) 以内，
+        否则报告和看门狗又会来不及写 —— 修复失效。
+        实测启动偏移只有约 2 秒（计划任务 10:36:37 触发，run.py 打印 10:36:39），
+        所以真正的余量来自 RUN_RESERVE_SEC，而不是靠把预算压得很低。
+        """
         from polytrade import config as C
         self.assertLessEqual(
-            C.RUN_BUDGET_SEC, 1800,
-            "整轮预算超过了计划任务的硬上限 1800s —— 又会被硬杀，修复失效")
-        self.assertLessEqual(
             C.RUN_BUDGET_SEC + C.RUN_RESERVE_SEC, 1800,
-            "预算 + 保留 超过 1800s：报告和看门狗可能来不及写")
+            "预算 %ds + 保留 %ds 超过 1800s：报告和看门狗可能来不及写"
+            % (C.RUN_BUDGET_SEC, C.RUN_RESERVE_SEC))
+        self.assertLessEqual(
+            C.RUN_BUDGET_SEC, 1800,
+            "整轮预算超过计划任务的硬上限 1800s —— 又会被硬杀")
         self.assertGreaterEqual(C.RUN_RESERVE_SEC, 120,
                                 "留给报告/看门狗的保留时间太短")
 
@@ -431,6 +437,71 @@ class TestRunWallClockBudget(unittest.TestCase):
         from polytrade import scan as SC
         self.assertIn("budget_sec", inspect.signature(SC.fetch_all_markets).parameters)
         self.assertIn("budget_sec", inspect.signature(SC.run_scan).parameters)
+
+    def test_every_heavy_step_takes_a_budget(self):
+        """
+        ★ 只给整轮预算是不够的：某一步内部若是个长循环，它读不到整轮预算，
+        整轮预算就形同虚设。实测「抓参照价+匹配赛程」跑了 1100s（预算 655s），
+        其中约 1000s 在 match.run_match 的 O(市场 x 赛程) 双重循环里。
+        所以每一步都必须有自己的 budget_sec 入口。
+        """
+        import inspect
+        from polytrade import refodds as RO
+        from polytrade import match as MT
+        for fn, name in ((RO.fetch_all, "refodds.fetch_all"),
+                         (MT.run_match, "match.run_match")):
+            self.assertIn("budget_sec", inspect.signature(fn).parameters,
+                          "%s 没有预算入口 —— 它可以把整轮运行拖死" % name)
+
+    def test_step_budget_is_smaller_than_the_whole_run(self):
+        """单步上限必须严格小于整轮预算，否则"分步约束"没有意义。"""
+        from polytrade import config as C
+        self.assertLess(
+            C.REFODDS_MAX_SEC, C.RUN_BUDGET_SEC,
+            "单步上限 %ds 不小于整轮预算 %ds" % (C.REFODDS_MAX_SEC, C.RUN_BUDGET_SEC))
+        self.assertLessEqual(
+            C.REFODDS_MAX_SEC + C.RUN_RESERVE_SEC, C.RUN_BUDGET_SEC,
+            "单步上限 + 保留 超过了整轮预算：报告可能被挤掉")
+
+    def test_match_budget_stops_the_loop_and_records_it(self):
+        """匹配赛程必须能被预算截断，且截断要落库（否则又变成静默少匹配）。"""
+        import tempfile
+        from polytrade import match as MT
+        from polytrade import refodds as RO
+        from polytrade import db as D
+
+        fd, path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        conn = D.connect(path)
+        MT.ensure_schema(conn)
+        RO.ensure_schema(conn)      # odds_fixtures 属于 refodds 的 schema
+        conn.execute("INSERT INTO odds_fixtures(fetched_ts,sport_key,commence_time,"
+                     "home,away,odds_home,odds_away,odds_draw) VALUES"
+                     "('2026-01-01T00:00:00+00:00','soccer_x','2026-01-02T00:00:00+00:00',"
+                     "'A','B',2.0,3.0,3.0)")
+        for i in range(50):
+            conn.execute(
+                "INSERT INTO observations(snap_date,snap_ts,market_id,question,league,"
+                "market_type,mid) VALUES(date('now'),?,'M%d','A vs B','L','moneyline',0.5)"
+                % i, (D.now_iso(),))
+        conn.commit()
+        conn.close()
+
+        real_connect = D.connect
+        D.connect = lambda *a, **kw: real_connect(path)
+        try:
+            # budget_sec=-1 -> 第一次迭代就超预算（用 -1 而非 0：Windows 上
+            # time.time() 连续两次取值可能相同，用 0 会漏测）
+            n_new, n_try = MT.run_match(verbose=False, budget_sec=-1)
+            c2 = real_connect(path)
+            rows = list(c2.execute("SELECT note FROM runs WHERE kind='match'"))
+            c2.close()
+        finally:
+            D.connect = real_connect
+            os.remove(path)
+        self.assertEqual(n_try, 0, "预算耗尽时不该匹配任何市场，实际 %s" % n_try)
+        self.assertEqual(len(rows), 1, "匹配截断没有落库 —— 又变成静默少匹配了")
+        self.assertIn("time_budget", rows[0][0])
 
     def test_refodds_budget_stops_the_loop_and_records_it(self):
         """

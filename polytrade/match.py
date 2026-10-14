@@ -181,11 +181,21 @@ def match_market(question, group_title, league, end_dt, fixtures,
     return best
 
 
-def run_match(verbose=True, min_conf=0.45):
+def run_match(verbose=True, min_conf=0.45, budget_sec=None):
     """
     对 observations 里的市场做匹配，写入 market_fixture。
     只写入 confidence >= min_conf 的；其余丢弃（宁可漏）。
+
+    ★ 2026-10-14：这一步是整轮运行被硬杀的真凶，改动三处 ——
+      1) **打印代价**。这里是个 O(市场数 x 赛程数) 的纯 Python 双重循环，
+         之前一句都不打印，所以外部看起来就是"卡死"。现在开头就报 N x M。
+      2) **进度**。每 1000 个市场打一行，再也不会出现十几分钟毫无输出。
+      3) **预算**。budget_sec 到点就在下一行停下，并报告还剩多少市场没匹配。
+         之前它完全没有上限：实测 10:36 那次运行，扫描 646s 结束后，
+         本步骤闷头跑了约 1000s，整轮 1765s，离 PT30M 只剩 36 秒。
     """
+    import time as _time
+    _t0 = _time.time()
     conn = D.connect()
     ensure_schema(conn)
     fx = pd.read_sql_query(
@@ -215,10 +225,22 @@ def run_match(verbose=True, min_conf=0.45):
     if verbose:
         print("  [match] 市场类型过滤: %d -> %d（只保留胜负类）"
               % (before, len(ms)), flush=True)
+        print("  [match] ★ 本次代价 = %d 个市场 x %d 条赛程 = 最多 %s 次比较"
+              % (len(ms), len(fixtures), format(len(ms) * len(fixtures), ",")),
+              flush=True)
+        if budget_sec is not None:
+            print("  [match] 预算 %.0fs" % budget_sec, flush=True)
 
     n_new, n_try = 0, 0
+    truncated = False
     for _, r in ms.iterrows():
+        if budget_sec is not None and (_time.time() - _t0) > budget_sec:
+            truncated = True
+            break
         n_try += 1
+        if verbose and n_try % 1000 == 0:
+            print("  [match] 进度 %d/%d，已匹配 %d，已用 %.0fs"
+                  % (n_try, len(ms), n_new, _time.time() - _t0), flush=True)
         m = match_market(r["question"], r["group_title"], r["league"],
                          r["end_date"], fixtures)
         if not m or m["confidence"] < min_conf:
@@ -234,8 +256,17 @@ def run_match(verbose=True, min_conf=0.45):
         n_new += 1
     conn.commit()
     if verbose:
-        print("  [match] 尝试 %d 个市场，成功匹配 %d 个（门槛 conf>=%.2f）"
-              % (n_try, n_new, min_conf), flush=True)
+        print("  [match] 尝试 %d 个市场，成功匹配 %d 个（门槛 conf>=%.2f），耗时 %.0fs"
+              % (n_try, n_new, min_conf, _time.time() - _t0), flush=True)
+    if truncated:
+        left = len(ms) - n_try
+        print("  [match] ⚠ 预算 %.0fs 用尽，还剩 %d 个市场未匹配（匹配覆盖不完整）"
+              % (budget_sec, left), flush=True)
+        try:
+            D.log_run(conn, "match", note="time_budget markets_unmatched=%d of %d"
+                      % (left, len(ms)))
+        except Exception as e:
+            print("  [match] 预算截断记录写入失败: %r" % e, flush=True)
     conn.close()
     return n_new, n_try
 
