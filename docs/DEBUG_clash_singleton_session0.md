@@ -121,20 +121,15 @@ targets = [(pid, sid) for pid, sid in _tasklist_sessions("clash-verge.exe") if s
 
 ---
 
-## 5. 遗留的架构问题（未解决，已知代价）
+## 5. 遗留的架构问题（已按第 8 节处理）
 
 后台任务现在**没有代理自愈能力了**：会话 0 里发现端口没监听时，只会打印提示并继续，
 后续 scan 的预检会抛出明确错误（这是刻意的，见 `DEBUG_proxy_outage_36h.md`）。
 
 这意味着：**如果 Clash 没开机自启，机器重启后自动化会一直失败到有人登录并打开 Clash 为止。**
 
-检查结果：`HKCU\...\Run` 里**没有** Clash Verge 条目，即当前**没开**开机自启。
-
-正确的解法不是「让后台脚本去拉 GUI」（那正是这次事故的来源），而是二选一：
-
-1. 在 Clash Verge 设置里打开**开机自启**（它会写进 HKCU Run，登录后落在桌面会话）——推荐，零成本；
-2. 或者让脚本走**无 GUI 的内核**（`verge-mihomo.exe -d <配置目录>`），
-   但那会和服务的核心管理器抢同一个端口，需要额外的互斥判断，暂不采用。
+正确的解法不是「让后台脚本去拉 GUI」（那正是这次事故的来源），
+而是让 GUI 在**用户登录时、在桌面会话里**自己起来 —— 见第 8 节。
 
 ---
 
@@ -155,13 +150,65 @@ targets = [(pid, sid) for pid, sid in _tasklist_sessions("clash-verge.exe") if s
 
 ---
 
-## 7. 现场状态（2026-10-14 09:45）
+## 7. 现场处理与结果（2026-10-14 09:54）
 
-- 隐形 GUI：`clash-verge.exe` pid 28540，会话 0，0 个顶层窗口。
-- 代理：正常，7897 在听。
-- 从桌面会话（会话 1/2）用 `taskkill` 杀它 → **Access is denied**
-  （该进程令牌无法由普通用户操作）。
-  ⇒ 清除现场的**唯一**手段是**重启**，或在会话 0 里跑一次修复后的
-  `ensure_proxy()`（定时任务下一次运行会自动做）。
-- 重启后：`ensure_proxy()` 已不会再创建新的隐形 GUI；
-  但请按第 5 节打开 Clash 的开机自启，否则自动化会在代理未启动时失败。
+从桌面会话（会话 1/2）用 `taskkill` 杀那个隐形 GUI → **Access is denied**
+（跨会话操作不了别人会话里的进程令牌）。
+但在**会话 0 里**跑一次修复后的 `ensure_proxy()` 就成功了 —— 也就是说
+**它自己造成的破坏，它自己能清**：
+
+```
+[proxy] ⚠ 发现 1 个跑在会话 0（无桌面）里的 Clash Verge GUI ... 正在清理
+[proxy]   ✓ 已结束 pid=28540（会话 0）
+[proxy] 已清掉 1 个隐形 GUI，单例锁已释放 —— 现在点 Clash 图标应该能正常弹窗。
+```
+
+清理后逐项复核：
+
+| 项 | 结果 |
+| --- | --- |
+| `clash-verge.exe` | 已无任何进程 |
+| `verge-mihomo.exe` | pid 20596 仍在跑（服务子进程，不受影响） |
+| 7897 | 仍在监听（owner = 20596） |
+| 过代理 HTTPS 请求 | HTTP 200 |
+| `singleton-instance.json` / `.lock` | 两个文件都能独占打开 → **锁已释放** |
+
+⇒ 用户此时点图标即可正常弹窗，**不需要重启**。
+
+---
+
+## 8. 开机自启（用户已批准，2026-10-14）
+
+第 5 节的遗留问题必须堵上，否则机器重启后自动化会一直失败。
+
+检查发现 Clash 侧 `verge.yaml` 里 `enable_auto_launch: false`
+（2026-09-21 的备份里也是 false，说明一直是关的），`HKCU\...\Run` 里也没有条目。
+
+做法：在**启动文件夹**里放一个快捷方式（而不是写注册表、也不改动 `verge.yaml`）：
+
+```
+C:\Users\26050\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\Clash Verge.lnk
+  → C:\Program Files\Clash Verge\clash-verge.exe
+```
+
+为什么选启动文件夹而不是别的：
+  * 它**在用户登录时的桌面会话里**启动，正是我们需要的会话；
+  * 它是一眼能看见、随手能删的文件，比注册表项好审计；
+  * 不改 `verge.yaml`，避免 Clash 自己再注册一份（`enable_auto_launch` 保持 false），
+    保证**全机只有一个自启机制**。
+
+代价：登录后会弹 Clash 主窗口（`enable_silent_start` 也是 false）。
+如果想静默起托盘，在 Clash 设置里打开「静默启动」并把那个快捷方式删掉、
+改用 Clash 自己的「开机自启」开关即可（两者只保留一个）。
+
+---
+
+## 9. 明确不做的方案
+
+**不做**「会话 0 里端口没监听就直接拉无界面的 `verge-mihomo.exe`」兜底（用户已否决）。
+理由：`verge-mihomo.exe` 现在是 `clash_verge_service` 管的，再起一个会抢同一个端口，
+需要一整套互斥/接管判断，风险大于收益；打开开机自启之后覆盖率已经足够。
+
+**不做**「会话号 != 桌面会话就杀 GUI」的宽判据。本机实测有两个桌面会话
+（explorer 在会话 1 和会话 2 各一个），宽判据会误杀用户正在用的 GUI。
+
