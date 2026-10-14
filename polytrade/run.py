@@ -16,6 +16,22 @@ import sys
 import traceback
 
 
+def plan_fetch_budget(budget_left, reserve, cap):
+    """
+    把「整轮还剩多少秒」折算成「这次抓取允许用多少秒」。
+
+    规则（2026-10-14）：
+      * 上限是 cap（配置里的 FETCH_TIME_BUDGET_SEC）—— 抓取本身不该无限跑；
+      * 再减去 reserve —— 那是留给参照价/AI/**报告与看门狗**的，不许被吃掉；
+      * 但至少给 60 秒：宁可抓一点点，也不要因为算术把抓取整个关掉
+        （抓取是唯一"错过就补不回来"的步骤）。
+
+    ⚠ 报告步骤永远不需要预算 —— 它是本地的、很便宜。所以"预算耗尽"的正确
+      含义是"跳过增强项"，不是"跳过留痕"。
+    """
+    return min(float(cap), max(60.0, float(budget_left) - float(reserve)))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scan-only", action="store_true")
@@ -35,6 +51,29 @@ def main():
     stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = ["=" * 90, "polytrade run @ %s" % stamp, "=" * 90]
     ok = True
+
+    # ★★★ 2026-10-14：整轮墙钟预算 ★★★
+    #   实测事故：那次运行在 [4/5] 抓参照价阶段跑过头，撞上计划任务的
+    #   ExecutionTimeLimit(PT30M) 被**硬杀** —— 报告与看门狗都没执行，
+    #   于是"没有信号"。而 ExecutionTimeLimit 本机改不了（改任务要账户密码）。
+    #   对策：每一步开跑前问一句"还剩多少时间"，不够就跳过并**明确上报**。
+    #   RUN_RESERVE_SEC 是留给报告/看门狗的，任何步骤都不许吃掉它。
+    import time as _time
+    _t0 = _time.time()
+    skipped_steps = []
+
+    def budget_left():
+        return C.RUN_BUDGET_SEC - (_time.time() - _t0)
+
+    def have_budget(need_sec, label):
+        """够就跑，不够就登记跳过（绝不静默省略）。"""
+        left = budget_left()
+        if left < need_sec + C.RUN_RESERVE_SEC:
+            skipped_steps.append("%s(剩%.0fs<需%.0fs)" % (label, left, need_sec))
+            out("      ⚠ 预算不足，跳过 %s：剩余 %.0fs，需要 %.0fs + 保留 %ds"
+                % (label, left, need_sec, C.RUN_RESERVE_SEC))
+            return False
+        return True
 
     def out(s):
         lines.append(str(s))
@@ -73,18 +112,29 @@ def main():
 
         if not args.report_only and not args.settle_only:
             out("[2/5] 扫描 Polymarket ...")
-            r = SC.run_scan(verbose=True, dry=args.dry)
+            # ★ 抓取预算 = min(配置上限, 整轮剩余 - 保留)。
+            #   不这样做的话，抓取会把留给参照价/AI/报告的额度吃光。
+            fetch_budget = plan_fetch_budget(budget_left(),
+                                             C.RUN_RESERVE_SEC,
+                                             C.FETCH_TIME_BUDGET_SEC)
+            out("      本轮剩余预算 %.0fs -> 抓取预算 %.0fs"
+                % (budget_left(), fetch_budget))
+            r = SC.run_scan(verbose=True, dry=args.dry, budget_sec=fetch_budget)
             out("      %s" % r)
 
         # 参照价（Pinnacle de-vig）。额度受限：内部有缓存与预算器，
         # 且只抓「Polymarket 有对应市场」的联赛 ⇒ 约 150 次/月（预算 400）。
         # 失败不影响主流程（参照价是增强项，不是必需项）。
-        if not args.report_only and not args.settle_only and not args.no_ref:
+        if (not args.report_only and not args.settle_only and not args.no_ref
+                and have_budget(180, "参照价+匹配赛程")):
             try:
                 from . import refodds as RO
                 from . import match as MT
                 out("[4/5] 抓参照价 + 匹配赛程 ...")
-                nf = RO.fetch_all(verbose=False)
+                # ★ 本步骤也要能吃预算截断 —— 它就是那次硬杀的真凶。
+                ref_budget = max(60.0, budget_left() - C.RUN_RESERVE_SEC - 60.0)
+                out("      参照价预算 %.0fs（剩余 %.0fs）" % (ref_budget, budget_left()))
+                nf = RO.fetch_all(verbose=True, budget_sec=ref_budget)
                 nm, _ = MT.run_match(verbose=False)
                 conn = DB.connect()
                 filled = RO.fill_ref_fair(conn)
@@ -98,7 +148,8 @@ def main():
         #   下注仍然由确定性代码决定 —— 否则实验规则就不固定了。
         #   AI 只负责：赛前独立给一个概率、落库、赛后由固定公式评估。
         if (not args.report_only and not args.settle_only
-                and not args.no_ai and getattr(C, "AI_FORECAST_ENABLED", False)):
+                and not args.no_ai and getattr(C, "AI_FORECAST_ENABLED", False)
+                and have_budget(90, "AI 赛前预测")):
             try:
                 from . import aiforecast as AF
                 out("[3/5] AI 赛前概率预测（落库，不下注）...")
@@ -106,6 +157,11 @@ def main():
                 out("      %s" % r)
             except Exception as e:
                 out("      AI 预测步骤跳过: %s" % str(e)[:160])
+
+        out("      整轮耗时 %.0fs（预算 %ds，保留 %ds）"
+            % (_time.time() - _t0, C.RUN_BUDGET_SEC, C.RUN_RESERVE_SEC))
+        if skipped_steps:
+            out("      ⚠ 因预算被跳过的步骤：%s" % "; ".join(skipped_steps))
 
         if not args.scan_only and not args.settle_only:
             out("[5/5] 生成报告 ...")
@@ -125,6 +181,19 @@ def main():
                         out("        %s" % i)
             except Exception as e:
                 out("      简报步骤跳过: %s" % str(e)[:120])
+            # ★ 预算跳过必须落到**人一定会打开的**简报里，不能只躺在日志里。
+            #   否则"这次少做了两件事"就变成了新的静默失败。
+            if skipped_steps:
+                try:
+                    dp2 = os.path.join(C.OUT_DIR, "digest_latest.txt")
+                    with open(dp2, "a", encoding="utf-8") as fh:
+                        fh.write("\n【本次运行因墙钟预算跳过的步骤】\n")
+                        for s in skipped_steps:
+                            fh.write("  - %s\n" % s)
+                        fh.write("  （原因：计划任务 ExecutionTimeLimit=PT30M 且本机改不了，"
+                                 "详见 config.RUN_BUDGET_SEC 注释）\n")
+                except Exception:
+                    pass
         elif args.report_only:
             txt = RP.report()
             RP.save_report(txt, "report_latest.txt")

@@ -357,11 +357,20 @@ def resolve_league(whitelist_name, obs_leagues):
     return None
 
 
-def fetch_all(conn=None, verbose=True, only_active=True):
+def fetch_all(conn=None, verbose=True, only_active=True, budget_sec=None):
     """
     抓白名单联赛的赔率。
     only_active=True 时只抓【Polymarket 近期有市场】的联赛 —— 省额度。
     用模糊匹配避免联赛名拼写差异导致的静默跳过。
+
+    budget_sec: 本步骤的墙钟预算（秒）；None = 不限。
+    ★ 2026-10-14 新增：这一步曾经把整轮运行拖死。
+      实测：2026-10-14 09:54 那次运行，10:09 扫描结束进入本步骤，
+      一直跑到 10:24 撞上计划任务的 ExecutionTimeLimit(PT30M) 被硬杀，
+      连报告都没写出来。原因是本步骤对每个联赛各发一次请求，
+      而单请求最坏是 HTTP_RETRIES(5) x HTTP_TIMEOUT(40s) = 200s，
+      几十个联赛叠起来可以无限长 —— 之前**没有任何上限**。
+      现在按墙钟截断，并且**明确上报**被跳过的联赛（静默截断 = 数据缺口）。
     """
     own = conn is None
     conn = conn or D.connect()
@@ -369,7 +378,13 @@ def fetch_all(conn=None, verbose=True, only_active=True):
     obs = leagues_with_pm_markets(conn) if only_active else None
     tot = 0
     skipped = []
-    for lg, sk in LEAGUE_MAP.items():
+    budget_skipped = []
+    t0 = time.time()
+    items = list(LEAGUE_MAP.items())
+    for idx, (lg, sk) in enumerate(items):
+        if budget_sec is not None and (time.time() - t0) > budget_sec:
+            budget_skipped = [x[0] for x in items[idx:]]
+            break
         if only_active and obs is not None:
             hit = resolve_league(lg, obs)
             if hit is None:
@@ -385,6 +400,18 @@ def fetch_all(conn=None, verbose=True, only_active=True):
     if skipped and verbose:
         print("  [refodds] 跳过 %d 个无对应 Polymarket 市场的联赛（省额度）: %s"
               % (len(skipped), ", ".join(skipped[:8])), flush=True)
+    if budget_skipped:
+        print("  [refodds] ⚠ 墙钟预算 %ds 用尽，%d 个联赛未抓（参照价覆盖不完整）：%s"
+              % (int(budget_sec), len(budget_skipped),
+                 ", ".join(budget_skipped[:12])), flush=True)
+        # ★ 写进 runs 表（kind='refodds'）而不是内存里的列表 ——
+        #   scan 的 runs.note 在扫描结束时就已经写完了，那时本步骤还没开始，
+        #   追加到内存列表里等于写进虚空。落库才看得见（看门狗能查）。
+        try:
+            D.log_run(conn, "refodds", note="time_budget leagues_skipped=%d (%s)"
+                      % (len(budget_skipped), ", ".join(budget_skipped[:12]))[:500])
+        except Exception as e:
+            print("  [refodds] 预算截断记录写入失败: %r" % e, flush=True)
     if own:
         conn.close()
     return tot

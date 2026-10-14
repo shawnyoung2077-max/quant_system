@@ -47,7 +47,19 @@ def _get(url, params=None, tries=None, timeout=None):
     return None
 
 
-def fetch_all_markets(verbose=True, workers=8):
+def fetch_all_markets(verbose=True, workers=8, budget_sec=None):
+    """
+    抓取全部联赛的市场。
+
+    budget_sec: 本次抓取的墙钟预算（秒）；None 时用 C.FETCH_TIME_BUDGET_SEC。
+    ★ 2026-10-14 新增这个参数：单靠 C.FETCH_TIME_BUDGET_SEC 保不住整个运行。
+      实测事故：09:54 那次运行，抓取自己按 720s 截断（正常），但后面的
+      「抓参照价 + 匹配赛程」又跑了 15 分钟，整个任务在 10:24 撞上计划任务的
+      ExecutionTimeLimit(PT30M) 被**硬杀** —— 报告和看门狗都没执行，
+      digest/report 一起过期。这和那条"崩溃无回执"的老 bug 是同一个形状。
+      所以预算必须由 run.py 按「整轮还剩多少时间」动态下发，而不是各步各写各的。
+    """
+    budget = C.FETCH_TIME_BUDGET_SEC if budget_sec is None else float(budget_sec)
     """
     按 sports catalog 的 primaryTagId 抓所有未结算体育市场。
 
@@ -107,7 +119,7 @@ def fetch_all_markets(verbose=True, workers=8):
             #   单次请求要重试 5 次 × 20s 超时 —— 那会把任务拖到被杀。
             #   所以按墙钟截断，并且**必须上报**（写进 runs.note 交给看门狗）：
             #   静默截断正是最初那个"联赛覆盖缺陷"能藏两天的原因。
-            if _time.time() - _t_start > C.FETCH_TIME_BUDGET_SEC:
+            if _time.time() - _t_start > budget:
                 _budget_hit["v"] = True
                 skipped_by_budget = True
                 break
@@ -151,7 +163,7 @@ def fetch_all_markets(verbose=True, workers=8):
                       % (done, len(tags), len(seen)), flush=True)
     if skipped_tags:
         print("  [scan] ⚠ 墙钟预算 %ds 用尽，%d 个联赛被跳过（覆盖不完整）：%s"
-              % (C.FETCH_TIME_BUDGET_SEC, len(skipped_tags),
+              % (int(budget), len(skipped_tags),
                  ", ".join(skipped_tags[:12])), flush=True)
         FETCH_COVERAGE_ISSUES.append("time_budget tags_skipped=%d (%s)" %
                                      (len(skipped_tags), ", ".join(skipped_tags[:12])))
@@ -465,13 +477,16 @@ def track_of(league, mid=None, wl=None):
     return "valid" if (r is not None and r >= C.MIN_EDGE_PCT_OF_STAKE) else "explore"
 
 
-def run_scan(verbose=True, dry=False):
-    """主扫描：抓 → 筛 → 写观测 → 建纸面下注。返回统计 dict。"""
+def run_scan(verbose=True, dry=False, budget_sec=None):
+    """主扫描：抓 → 筛 → 写观测 → 建纸面下注。返回统计 dict。
+
+    budget_sec: 交给 fetch_all_markets 的墙钟预算（秒）；None = 用配置默认值。
+    """
     conn = D.connect()
     ts = D.now_iso()
     today = D.today()
 
-    markets = fetch_all_markets(verbose=verbose)
+    markets = fetch_all_markets(verbose=verbose, budget_sec=budget_sec)
     df = to_frame(markets)
     if verbose:
         print("  [scan] 抓到 %d 个市场" % len(df), flush=True)

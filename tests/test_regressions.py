@@ -376,5 +376,97 @@ class TestProxySessionGuard(unittest.TestCase):
                          "会话 0 里竟然拉起了 GUI —— 单例锁会被抢走：%s" % popen_calls)
 
 
+class TestRunWallClockBudget(unittest.TestCase):
+    """
+    bug #8（2026-10-14）：整轮运行跑过头，撞上计划任务的 ExecutionTimeLimit 被硬杀。
+    ========================================================================
+    实测事故：
+        09:54  开始（[1/5] 结算）
+        10:09  [2/5] 扫描结束（自己按 720s 正常截断，runs.note 记了 time_budget）
+        10:09~ [4/5] 抓参照价 + 匹配赛程 …… 一直跑
+        10:24  撞上 ExecutionTimeLimit = PT30M，被**硬杀**
+    后果：报告没生成、看门狗没跑、digest/report 一起停在旧版本。
+    这与第 5 条 bug（崩溃无回执）是同一个形状，只是触发者从异常变成了超时。
+
+    而 ExecutionTimeLimit **改不了**（Set-ScheduledTask 要账户密码，报
+    "The user name or password is incorrect"），所以只能让运行适应 30 分钟天花板。
+    """
+
+    def test_budget_fits_inside_the_hard_task_limit(self):
+        """★ 最关键的一条：预算必须留在 PT30M(=1800s) 以内。"""
+        from polytrade import config as C
+        self.assertLessEqual(
+            C.RUN_BUDGET_SEC, 1800,
+            "整轮预算超过了计划任务的硬上限 1800s —— 又会被硬杀，修复失效")
+        self.assertLessEqual(
+            C.RUN_BUDGET_SEC + C.RUN_RESERVE_SEC, 1800,
+            "预算 + 保留 超过 1800s：报告和看门狗可能来不及写")
+        self.assertGreaterEqual(C.RUN_RESERVE_SEC, 120,
+                                "留给报告/看门狗的保留时间太短")
+
+    def test_fetch_budget_never_eats_the_reserve(self):
+        """抓取预算 = min(cap, 剩余 - 保留)，绝不能吃到保留额。"""
+        from polytrade import run as RUN
+        # 剩余 500s、保留 240s、上限 720s -> 260s（受剩余约束，不受 cap 约束）
+        self.assertEqual(RUN.plan_fetch_budget(500, 240, 720), 260)
+        # 剩余很多 -> 受 cap 约束
+        self.assertEqual(RUN.plan_fetch_budget(1500, 240, 720), 720)
+        # 剩余几乎没了 -> 保底 60s，而不是 0（抓取是唯一"错过补不回来"的步骤）
+        self.assertEqual(RUN.plan_fetch_budget(100, 240, 720), 60)
+        self.assertEqual(RUN.plan_fetch_budget(-50, 240, 720), 60)
+
+    def test_reserve_is_always_positive_after_planning(self):
+        """任意剩余时间下，规划完都必须给保留额留下 >= RUN_RESERVE_SEC-60。"""
+        from polytrade import run as RUN
+        from polytrade import config as C
+        for left in (60, 200, 400, 900, 5000):
+            fb = RUN.plan_fetch_budget(left, C.RUN_RESERVE_SEC, C.FETCH_TIME_BUDGET_SEC)
+            self.assertLessEqual(
+                fb, max(60.0, left - C.RUN_RESERVE_SEC) + 1e-9,
+                "left=%s 时抓取预算 %s 吃掉了保留额" % (left, fb))
+
+    def test_scan_accepts_and_forwards_budget(self):
+        """run_scan 必须能把预算透传给 fetch_all_markets（否则改了个寂寞）。"""
+        import inspect
+        from polytrade import scan as SC
+        self.assertIn("budget_sec", inspect.signature(SC.fetch_all_markets).parameters)
+        self.assertIn("budget_sec", inspect.signature(SC.run_scan).parameters)
+
+    def test_refodds_budget_stops_the_loop_and_records_it(self):
+        """
+        参照价步骤（真凶）必须能被预算截断，且截断要**落库**。
+        落库而不是留在内存：scan 的 runs.note 在扫描结束时就写完了，
+        那时本步骤还没开始，写内存列表等于写进虚空。
+        """
+        import inspect
+        import tempfile
+        from polytrade import refodds as RO
+        from polytrade import db as D
+
+        self.assertIn("budget_sec", inspect.signature(RO.fetch_all).parameters)
+
+        fd, path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        conn = D.connect(path)
+        calls = []
+        real_map, real_fetch = RO.LEAGUE_MAP, RO.fetch_league
+        RO.LEAGUE_MAP = {"L%d" % i: "soccer_l%d" % i for i in range(6)}
+        RO.fetch_league = lambda conn, sk, **kw: (calls.append(sk), (0, "stub"))[1]
+        try:
+            # 用 -1 而不是 0：Windows 上 time.time() 两次连续取值可能完全相同，
+            # 用 0 会让第一次迭代的 elapsed(0.0) > 0 判为 False，测不出东西。
+            RO.fetch_all(conn=conn, verbose=False, only_active=False, budget_sec=-1)
+            rows = list(conn.execute(
+                "SELECT kind, note FROM runs WHERE kind='refodds'"))
+        finally:
+            RO.LEAGUE_MAP, RO.fetch_league = real_map, real_fetch
+            conn.close()
+            os.remove(path)
+        self.assertEqual(calls, [], "预算耗尽时不该发任何请求，实际 %s" % calls)
+        self.assertEqual(len(rows), 1, "预算截断没有落库 —— 又变成静默少采了")
+        self.assertIn("time_budget", rows[0][1])
+        self.assertIn("leagues_skipped=6", rows[0][1])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
