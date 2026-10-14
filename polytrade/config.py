@@ -212,9 +212,9 @@ def kill_invisible_gui(verbose=True):
     if not targets:
         return []
     if verbose:
-        print("  [proxy] ⚠ 发现 %d 个跑在非桌面会话（会话 %s；桌面在会话 %d）的 "
-              "Clash Verge GUI —— 它们会抢走单例锁、导致点图标无窗口，正在清理"
-              % (len(targets), ",".join(str(s) for _, s in targets), desk), flush=True)
+        print("  [proxy] ⚠ 发现 %d 个跑在会话 0（无桌面）里的 Clash Verge GUI "
+              "—— 它们会抢走单例锁、导致点图标无窗口，正在清理"
+              % len(targets), flush=True)
     import subprocess
     killed = []
     for pid, sid in targets:
