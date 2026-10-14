@@ -232,5 +232,149 @@ class TestInvariantsSelfTest(unittest.TestCase):
             os.remove(path)
 
 
+class TestProxySessionGuard(unittest.TestCase):
+    """
+    bug #7（2026-10-13 / -14）：在无桌面的会话里拉起 Clash Verge GUI。
+    ========================================================================
+    现象：用户点 Clash 图标**什么窗口都不弹**。
+    根因：定时任务跑在会话 0（服务会话，没有桌面），
+          polytrade_run.bat -> python -> ensure_proxy() 在那里 Popen 了
+          clash-verge.exe。它在会话 0 创建不出窗口（Tray 报
+          os error -2147467259），**却抢到了单例锁**；
+          此后用户每次点图标，新实例都把「显示窗口」转发给它，
+          日志打印「窗口激活成功」，用户永远看不到。
+
+    这条 bug 的修复**失败过一次**，那才是最值得锁的部分：
+      第一版的 interactive_session() 在会话 0 时判据是
+      「tasklist 里有没有 explorer.exe」—— 而 tasklist 会列出**所有会话**的
+      explorer。本机实测会话 1、会话 2 各有一个 explorer，
+      于是会话 0 里的进程以为自己能显示窗口，**又把 GUI 拉进了会话 0**。
+    所以第一条测试专门锁「会话号必须按会话号判，不能按有没有 explorer 判」。
+    """
+
+    def setUp(self):
+        self._orig_popen = None
+
+    def _patch(self, **kw):
+        """临时替换 config 里的探测函数，返回还原用的闭包。"""
+        saved = {}
+        for name, fn in kw.items():
+            saved[name] = getattr(C, name)
+            setattr(C, name, fn)
+        def restore():
+            for name, fn in saved.items():
+                setattr(C, name, fn)
+        return restore
+
+    def test_session0_is_not_interactive_even_when_explorer_exists_elsewhere(self):
+        """核心回归：本机存在会话1/2 的 explorer 时，会话 0 仍必须是"非交互式"。"""
+        def fake_ts(image):
+            if image.lower() == "explorer.exe":
+                # 本机实测：会话 1 和会话 2 各一个 explorer，**没有一个在会话 0**
+                return [(13232, 1), (2324, 2)]
+            return []
+        restore = self._patch(_tasklist_sessions=fake_ts,
+                              _session_of_pid=lambda pid: 0)
+        try:
+            self.assertFalse(
+                C.interactive_session(),
+                "会话 0 竟被判成可交互 —— GUI 又会被拉进无桌面会话，"
+                "这正是 2026-10-14 事故重演的原因")
+        finally:
+            restore()
+
+    def test_nonzero_session_is_interactive(self):
+        restore = self._patch(_session_of_pid=lambda pid: 1)
+        try:
+            self.assertTrue(C.interactive_session())
+        finally:
+            restore()
+
+    def test_kill_targets_only_session0_gui(self):
+        """
+        清理目标**只能**是会话 0 的 clash-verge.exe。
+        不能采用「和桌面会话号不同就杀」—— 本机有会话 1 和 2 两个 explorer，
+        宽判据会误杀用户在另一个会话里正常使用的 GUI。
+        """
+        import subprocess
+
+        def fake_ts(image):
+            n = image.lower()
+            if n == "clash-verge.exe":
+                return [(111, 0), (222, 1), (333, 2)]
+            if n == "explorer.exe":
+                return [(9, 1)]
+            return []
+
+        calls = []
+
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_run(cmd, *a, **kw):
+            calls.append(cmd)
+            return R()
+
+        restore = self._patch(_tasklist_sessions=fake_ts)
+        old_run = subprocess.run
+        subprocess.run = fake_run
+        try:
+            got = C.kill_invisible_gui(verbose=False)
+        finally:
+            subprocess.run = old_run
+            restore()
+        self.assertEqual(got, [111], "只应结束会话 0 的那个，实际 %s" % got)
+        self.assertEqual(len(calls), 1, "不该对会话 1/2 的 GUI 动手：%s" % calls)
+        self.assertIn("111", " ".join(str(x) for x in calls[0]))
+
+    def test_no_desktop_session_means_no_kill(self):
+        """本机若定位不到桌面会话（例如完全无头），宁可不杀，绝不误杀。"""
+        restore = self._patch(_tasklist_sessions=lambda image: [],
+                              _session_of_pid=lambda pid: 0)
+        try:
+            self.assertEqual(C.kill_invisible_gui(verbose=False), [])
+        finally:
+            restore()
+
+    def test_tasklist_sessions_parses_csv(self):
+        import subprocess
+
+        class R:
+            returncode = 0
+            stdout = ('"Image Name","PID","Session Name","Session#","Mem Usage"\r\n'
+                      '"clash-verge.exe","28540","Services","0","12,345 K"\r\n'
+                      '"clash-verge.exe","777","Console","1","1,000 K"\r\n'
+                      'INFO: No tasks are running which match the specified criteria.\r\n')
+            stderr = ""
+
+        old_run = subprocess.run
+        subprocess.run = lambda *a, **kw: R()
+        try:
+            got = C._tasklist_sessions("clash-verge.exe")
+        finally:
+            subprocess.run = old_run
+        self.assertEqual(got, [(28540, 0), (777, 1)], "CSV 解析错了：%s" % got)
+
+    def test_ensure_proxy_refuses_gui_in_session0(self):
+        """端到端：会话 0 里 ensure_proxy() 绝不能 Popen 出 GUI 进程。"""
+        import subprocess
+        popen_calls = []
+        restore = self._patch(_detect_proxy=lambda: None,
+                              _session_of_pid=lambda pid: 0,
+                              _tasklist_sessions=lambda image: [])
+        old_popen = subprocess.Popen
+        subprocess.Popen = lambda *a, **kw: popen_calls.append(a)
+        try:
+            got = C.ensure_proxy(wait_sec=0, verbose=False)
+        finally:
+            subprocess.Popen = old_popen
+            restore()
+        self.assertIsNone(got)
+        self.assertEqual(popen_calls, [],
+                         "会话 0 里竟然拉起了 GUI —— 单例锁会被抢走：%s" % popen_calls)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

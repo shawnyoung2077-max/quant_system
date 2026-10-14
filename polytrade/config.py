@@ -61,6 +61,32 @@ if PROXY:
 #
 # 对策：启动时若发现端口没监听，就主动把 Clash Verge 拉起来，并等它把内核带起来。
 # 拉不起来也不吞掉 —— 后面 scan 的预检会抛出明确错误，看门狗也会记录。
+#
+# ★★★ 2026-10-13 重大修正：这个"自愈"本身造成了更严重的事故 ★★★
+#
+#   事故现象：用户点击 Clash Verge 图标，**什么窗口都不弹**。
+#
+#   根因链（实测）：
+#     polytrade_run.bat → cmd.exe(会话0) → python.exe(会话0)
+#       → ensure_proxy() 在这里 Popen 了 clash-verge.exe
+#       → clash-verge 跑在【会话 0】，那里没有交互式桌面
+#       → 日志报 [[Tray]] tray icon error (os error -2147467259)，窗口也创建不了
+#       → 但它抢到了【单例锁】（本地端口 53263 + token）
+#       → 用户之后每一次点图标，新实例都检测到单例、把"显示窗口"转发给会话 0 那个，
+#         日志反复打印「检测到从单例模式恢复应用窗口 / 窗口激活成功」，
+#         而那个窗口在会话 0 里，用户永远看不到。
+#
+#   所以：**在非交互式会话里启动 GUI 程序，不只是"没用"，是会抢走单例、
+#   把用户自己的 GUI 一起弄坏。** 这比原来的问题（代理没起来）更难排查。
+#
+#   修正（两件，缺一不可）：
+#     1) 只有当**当前进程就在交互式会话**里时才允许拉起；会话 0 一律不启。
+#        代价是后台任务失去自愈能力 —— 但这本来就是个错误的能力。
+#     2) 已经坏掉的那些怎么办？见 kill_invisible_gui()：
+#        每次 ensure_proxy() 开头都会去找「会话号 != 桌面会话」的 clash-verge.exe
+#        并结束它，把单例锁还回来。只杀 GUI，不碰 verge-mihomo 和服务，
+#        所以代理不受影响。
+#   另外：真要在无桌面环境里保代理，正解不是拉 GUI，而是让它**开机自启到桌面会话**。
 AUTO_START_PROXY = True
 PROXY_EXE_CANDIDATES = [
     r"C:\Program Files\Clash Verge\clash-verge.exe",
@@ -69,14 +95,169 @@ PROXY_EXE_CANDIDATES = [
 ]
 
 
+def interactive_session():
+    """
+    当前进程是否在**用户的桌面会话**里（即能不能创建窗口和托盘图标）。
+
+    Windows 的会话 0 是服务会话，没有交互式桌面：
+    在那里启动 GUI 程序会得到一个永远看不见的窗口，而且它会抢走单例锁，
+    导致用户自己点图标也打不开 —— 2026-10-13 就是这么坏掉的。
+
+    ★★★ 2026-10-14 修正：这个函数的第一版**判错了** ★★★
+      第一版在会话 0 时的判据是「tasklist 里有没有 explorer.exe」，
+      但 `tasklist /FI "IMAGENAME eq explorer.exe"` 会列出**所有会话**的
+      explorer。本机实测有会话 1 和会话 2 各一个 explorer，
+      于是会话 0 里的进程看到 explorer.exe 就以为自己能显示窗口，
+      又把 GUI 拉进了会话 0 —— 10-14 09:24 的日志里 Tray 报错、
+      单例被抢，全是同一个事故的重演（也就是说：**修正本身失效了**）。
+
+      正确的判据只能是**会话号本身**：会话号 != 0 就是桌面会话；
+      会话 0 必须看到会话号同为 0 的 explorer 才算（现实中几乎不会发生）。
+    """
+    try:
+        me = _session_of_pid(os.getpid())
+    except Exception:
+        return False
+    if me is None:
+        return False
+    if me != 0:
+        return True
+    # 本进程就在会话 0：要求 explorer 也**在会话 0**（而不是"任何会话里有 explorer"）
+    try:
+        return any(sid == 0 for _pid, sid in _tasklist_sessions("explorer.exe"))
+    except Exception:
+        return False
+
+
+def _session_of_pid(pid):
+    """返回进程所在会话号；查不到返回 None。"""
+    try:
+        import ctypes
+        s = ctypes.c_ulong(0)
+        ok = ctypes.windll.kernel32.ProcessIdToSessionId(int(pid), ctypes.byref(s))
+        if not ok:
+            return None
+        return int(s.value)
+    except Exception:
+        return None
+
+
+def _tasklist_sessions(image):
+    """用 tasklist 列出某镜像名所有进程的 (pid, session)；失败返回 []。"""
+    import csv as _csv
+    import io
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq %s" % image, "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=20)
+    except Exception:
+        return []
+    out = []
+    for row in _csv.reader(io.StringIO(r.stdout or "")):
+        # 列： "Image Name","PID","Session Name","Session#","Mem Usage"
+        if len(row) < 4 or row[0].strip().lower() != image.lower():
+            continue
+        try:
+            out.append((int(row[1]), int(row[3])))
+        except Exception:
+            continue
+    return out
+
+
+def interactive_session_id():
+    """
+    返回**用户桌面所在的会话号**（用 explorer.exe 定位）；定位不到返回 None。
+
+    这是"用户看得见窗口"的那个会话。跑在别的会话里的 GUI 进程，
+    它创建的窗口用户永远看不到。
+    """
+    for _pid, sid in _tasklist_sessions("explorer.exe"):
+        if sid != 0:
+            return sid
+    # 退化：本进程若在非 0 会话，就以本会话为准
+    return _session_of_pid(os.getpid())
+
+
+def kill_invisible_gui(verbose=True):
+    """
+    ★ 2026-10-13 自愈：结束掉跑在**会话 0** 里的 clash-verge.exe。
+
+    为什么需要它：一旦 GUI 被错误地拉进会话 0，它没有桌面，窗口永远不可见，
+    但它**已经抢到了单例锁**。此后用户每次点图标，新实例都只是把
+    「显示窗口」转发给它，日志打印「窗口激活成功」，用户却什么都看不到 ——
+    唯一的恢复手段就是把这个进程杀掉（或重启）。
+
+    ★ 判据故意收得很窄：**只看会话 0**。
+      Windows Vista 以后会话 0 是服务会话，**永远没有交互式桌面**，
+      所以那里出现的 GUI 进程 100% 是隐形的，杀它绝不可能误伤用户。
+      不采用「和 desktop session 不同就杀」的宽判据 —— 本机实测存在
+      会话 1 和会话 2 两个 explorer（多会话登录/远程桌面），
+      宽判据会误杀用户在另一个会话里正常使用的 GUI。
+      实测记录：explorer.exe = [(13232, 1), (2324, 2)]。
+
+    ★ 只杀 clash-verge.exe（GUI），**绝不碰** verge-mihomo.exe / 服务，
+      所以代理本身不受影响 —— 实测 7897 在 GUI 被杀后仍正常。
+
+    返回被杀掉的 pid 列表。杀不掉会打印原因（通常是拒绝访问 -> 需要重启）。
+    """
+    desk = interactive_session_id()
+    if desk in (None, 0):
+        if verbose:
+            print("  [proxy] 本机没有可用的桌面会话，跳过 GUI 清理", flush=True)
+        return []
+    targets = [(pid, sid) for pid, sid in _tasklist_sessions("clash-verge.exe")
+               if sid == 0]
+    if not targets:
+        return []
+    if verbose:
+        print("  [proxy] ⚠ 发现 %d 个跑在非桌面会话（会话 %s；桌面在会话 %d）的 "
+              "Clash Verge GUI —— 它们会抢走单例锁、导致点图标无窗口，正在清理"
+              % (len(targets), ",".join(str(s) for _, s in targets), desk), flush=True)
+    import subprocess
+    killed = []
+    for pid, sid in targets:
+        try:
+            r = subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                               capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=20)
+            if r.returncode == 0:
+                killed.append(pid)
+                if verbose:
+                    print("  [proxy]   ✓ 已结束 pid=%d（会话 %d）" % (pid, sid), flush=True)
+            elif verbose:
+                print("  [proxy]   ✗ 结束 pid=%d 失败：%s"
+                      % (pid, ((r.stdout or "") + (r.stderr or "")).strip()[:200]),
+                      flush=True)
+                print("  [proxy]     拒绝访问 = 该进程令牌更高，只能重启机器清掉它。",
+                      flush=True)
+        except Exception as e:
+            if verbose:
+                print("  [proxy]   ✗ 结束 pid=%d 异常：%r" % (pid, e), flush=True)
+    if killed and verbose:
+        print("  [proxy] 已清掉 %d 个隐形 GUI，单例锁已释放 —— "
+              "现在点 Clash 图标应该能正常弹窗。" % len(killed), flush=True)
+    return killed
+
+
 def ensure_proxy(wait_sec=45, verbose=True):
     """
     确保代理端口在监听。不在就尝试拉起 Clash Verge 并等待内核起来。
 
     返回最终可用的代理地址（或 None）。会顺便刷新 os.environ，
     因为 requests 是在请求时才读环境变量的。
+
+    ⚠ 只在交互式会话里才会真的去拉起 GUI —— 见上面 2026-10-13 的事故记录。
     """
     global PROXY
+    # ★ 先清理历史遗留的隐形 GUI：即使代理现在是好的也要做，
+    #   因为那个进程会一直霸占单例锁，让用户点不开自己的 Clash。
+    try:
+        kill_invisible_gui(verbose=verbose)
+    except Exception as e:
+        if verbose:
+            print("  [proxy] GUI 清理异常（忽略）: %r" % e, flush=True)
     p = _detect_proxy()
     if p:
         PROXY = p
@@ -84,6 +265,18 @@ def ensure_proxy(wait_sec=45, verbose=True):
     if not AUTO_START_PROXY:
         if verbose:
             print("  [proxy] 7897/7890 均未监听，且 AUTO_START_PROXY=False", flush=True)
+        return None
+
+    # ★ 2026-10-13：非交互式会话（通常是会话 0）绝不允许拉起 GUI。
+    #   在那里启动会得到一个看不见的窗口，而且会抢走单例锁，
+    #   把用户自己的 GUI 一起弄坏 —— 这正是今天那次事故。
+    if not interactive_session():
+        if verbose:
+            print("  [proxy] ⚠ 端口未监听，但当前是**非交互式会话**（无桌面）——"
+                  "拒绝拉起 Clash Verge。", flush=True)
+            print("        原因：在无桌面会话里启动 GUI 会得到一个看不见的窗口，"
+                  "并抢走单例锁，导致用户点图标也打不开。", flush=True)
+            print("        请在桌面会话里手动启动 Clash Verge，或让它开机自启。", flush=True)
         return None
 
     exe = next((x for x in PROXY_EXE_CANDIDATES if x and os.path.exists(x)), None)
