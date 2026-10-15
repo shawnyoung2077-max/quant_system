@@ -619,15 +619,36 @@ class TestProxyDelegation(unittest.TestCase):
         self.assertIsNone(got)
 
     def test_helper_task_module_exists_and_is_wired(self):
-        """辅助任务的载体必须真的存在、且名字和配置一致。"""
+        """
+        辅助任务的载体必须真的存在、且名字和配置一致。
+
+        ★ 2026-10-15 实测修正：载体从 .bat 改成 **python 脚本**。
+          原因是 .bat + LogonType=Interactive 组合会**静默哑掉**：
+          `schtasks /Run` 返回成功、LastTaskResult=0、LastRunTime 正常更新，
+          但日志文件里一个字都没有 —— "任务跑了"和"任务做了什么"断线。
+          （同样形态的 polytrade_scan.bat 用 LogonType=Password 就正常。）
+          所以计划任务改为**直接执行 python.exe**，日志由进程自己写。
+        """
         from polytrade import ensureproxy
         self.assertTrue(callable(ensureproxy.main))
-        bat = os.path.join(ROOT, "polytrade_proxy_up.bat")
-        self.assertTrue(os.path.exists(bat), "缺少 %s —— 辅助任务没有载体" % bat)
-        with open(bat, encoding="utf-8", errors="replace") as fh:
+        runner = os.path.join(ROOT, "polytrade_proxy_up.py")
+        self.assertTrue(os.path.exists(runner),
+                        "缺少 %s —— 辅助任务没有载体" % runner)
+        with open(runner, encoding="utf-8", errors="replace") as fh:
             body = fh.read()
-        self.assertIn("polytrade.ensureproxy", body)
+        self.assertIn("ensureproxy", body)
         self.assertEqual(C.PROXY_HELPER_TASK, "polytrade_proxy_up")
+
+    def test_helper_writes_its_own_log_not_relying_on_shell(self):
+        """
+        日志必须由进程自己写。靠 `>>` 重定向的话，一旦被计划任务调用，
+        实测会出现"任务成功但零输出"的黑洞。
+        """
+        import inspect
+        from polytrade import ensureproxy as EP
+        src = inspect.getsource(EP)
+        self.assertIn("_Tee", src, "ensureproxy 没有自己做 tee 写日志")
+        self.assertIn("proxy_up.log", src)
 
 
 class TestStdoutEncodingSafety(unittest.TestCase):

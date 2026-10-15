@@ -274,15 +274,51 @@ interactive      = False
 只是当时跑在了错误的会话里；现在它跑在正确的会话里。
 验证它需要真的杀掉用户的 Clash，代价不值得，故**如实标注为未验证**。
 
-### 10.3 一个必须注明的机器级改动
+### 10.3 一个必须注明的机器级改动（含注册命令）
 
 `polytrade_proxy_up` 是**注册在系统里的计划任务**，不在 git 仓库里。
-换机器或重装后要重新注册：
+换机器或重装后要重新注册（实测：**不需要账户密码**）：
 
 ```powershell
-schtasks /Create /TN "polytrade_proxy_up" /SC ONCE /ST 23:59 /RU "<用户名>" /IT /F `
-  /TR "D:\26050\Documents\quant_system\polytrade_proxy_up.bat"
+$py   = "C:\Users\26050\AppData\Local\Programs\Python\Python311\python.exe"
+$root = "D:\26050\Documents\quant_system"
+Register-ScheduledTask -TaskName "polytrade_proxy_up" -Force `
+  -Action    (New-ScheduledTaskAction -Execute $py `
+                -Argument "`"$root\polytrade_proxy_up.py`"" -WorkingDirectory $root) `
+  -Trigger   (New-ScheduledTaskTrigger -Once -At (Get-Date -Hour 23 -Minute 59 -Second 0)) `
+  -Principal (New-ScheduledTaskPrincipal -UserId "<用户名>" -LogonType Interactive -RunLevel Limited)
 ```
+
+### 10.4 ★★★ 排查中发现的坑：`.bat` + `LogonType=Interactive` 会**静默哑掉** ★★★
+
+第一版是把任务指向一个 `.bat`（里面 `python -m polytrade.ensureproxy >> 日志 2>&1`）。
+**它在手动执行时完全正常，被计划任务调用时却什么都不写：**
+
+| 观测项 | 值 |
+| --- | --- |
+| `schtasks /Run` 返回 | `SUCCESS: Attempted to run...` |
+| `LastTaskResult` | `0` |
+| `LastRunTime` | 正常更新（如 18:05:11） |
+| `proxy_up.log` | **一个字都没有**（mtime 停在几小时前） |
+
+对照：同样形态的 `.bat` 任务 `polytrade_scan`（`LogonType=Password`）完全正常；
+而本任务**必须**是 Interactive 才能进桌面会话 —— 正是这个组合哑掉。
+
+于是 18:05 那轮出现了最误导人的现象：主任务日志显示
+「辅助任务在 45s 内没能拉起代理 —— 通常意味着当前桌面上没人登录」，
+**但桌面上明明有人登录**（explorer 在会话 1 和 2 各一个）。
+如果只信那句提示，就会去查错方向。
+
+**修正（两处，缺一不可）：**
+
+1. 计划任务**直接执行 `python.exe`** + 脚本绝对路径（形态与当初验证通过的
+   探针任务完全一致），不再经过 `.bat`；
+2. **日志由进程自己写**（`ensureproxy._Tee`），不依赖任何 shell 重定向。
+   原则与仓库其他设计一致：**"任务跑了"与"任务做了什么"之间不能断线。**
+
+验证：重新注册后触发，`proxy_up.log` 的 mtime 由 18:11:51 变为 18:17:47，
+新增了完整的一整块输出 ⇒ 链路真的通了。那个会哑掉的 `.bat` 已删除
+（留着就是陷阱）。
 
 ---
 

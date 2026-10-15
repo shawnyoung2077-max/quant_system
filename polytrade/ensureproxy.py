@@ -30,6 +30,7 @@ ensureproxy.py —— 只负责「把代理拉起来」，不做任何抓取
                                               Clash Verge GUI 正常启动、托盘正常
 """
 
+import os
 import sys
 
 # ★ 2026-10-15：入口显式建立编码安全 —— 见 run.py 顶部那段说明。
@@ -42,16 +43,72 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 
+class _Tee(object):
+    """
+    同时写 stdout 和日志文件。
+
+    ★ 为什么必须自己写文件、不能靠 `>>` 重定向：
+      本入口是被**计划任务**调用的。实测踩到：用 .bat + `>>` 重定向注册的任务，
+      `schtasks /Run` 返回成功、LastTaskResult=0、LastRunTime 正常更新，
+      **但日志文件里一个字都没有** —— 也就是说"任务跑了"和"任务做了什么"
+      之间断了线，排查时完全瞎。
+      （对照：同样形态的 .bat 任务 polytrade_scan 用 LogonType=Password 就正常；
+        本任务必须是 Interactive 才能进桌面会话，就是在这个组合下哑掉。）
+      结论：**日志由进程自己写，不依赖任何 shell**。这样无论谁来调用，
+      都一定留得下痕迹 —— 这和本仓库其他"留痕优先"的设计是同一个原则。
+    """
+
+    def __init__(self, fh, stream):
+        self.fh = fh
+        self.stream = stream
+
+    def write(self, s):
+        self.stream.write(s)
+        try:
+            self.fh.write(s)
+            self.fh.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        try:
+            self.stream.flush()
+        except Exception:
+            pass
+        try:
+            self.fh.flush()
+        except Exception:
+            pass
+
+
 def main():
     from . import config as C
-    print("=" * 70, flush=True)
-    print("[ensureproxy] 在 Session=%s 里尝试保证代理可用" % _session(), flush=True)
-    p = C.ensure_proxy(wait_sec=90, verbose=True)
-    if p:
-        print("[ensureproxy] ✓ 代理已就绪: %s" % p, flush=True)
-        return 0
-    print("[ensureproxy] ✗ 代理仍不可用（可能未注册辅助任务，或端口被占用）", flush=True)
-    return 1
+
+    log_path = os.path.join(C.LOG_DIR, "proxy_up.log")
+    try:
+        fh = open(log_path, "a", encoding="utf-8")
+    except Exception:
+        fh = None
+    real_out, real_err = sys.stdout, sys.stderr
+    if fh is not None:
+        sys.stdout = _Tee(fh, real_out)
+        sys.stderr = _Tee(fh, real_err)
+    try:
+        print("=" * 70, flush=True)
+        print("[ensureproxy] 在 Session=%s 里尝试保证代理可用" % _session(), flush=True)
+        p = C.ensure_proxy(wait_sec=90, verbose=True)
+        if p:
+            print("[ensureproxy] ✓ 代理已就绪: %s" % p, flush=True)
+            return 0
+        print("[ensureproxy] ✗ 代理仍不可用（桌面会话里也没能拉起 Clash）", flush=True)
+        return 1
+    finally:
+        sys.stdout, sys.stderr = real_out, real_err
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass
 
 
 def _session():
