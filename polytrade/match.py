@@ -77,6 +77,22 @@ def _tokens(name):
     return {t for t in s.split() if t and t not in TEAM_STOP and len(t) > 1}
 
 
+def _team_matches_tokens(ta, tb):
+    """
+    队名 token 集合是否指同一支球队。返回 (是否匹配, 共享的具辨识度 token 数)。
+
+    ★ 2026-10-15：从 team_matches 里抽出来，供索引化后的匹配循环直接用
+      预先算好的 token 集合，避免在 48 万次比较里反复做正则和建集合。
+      语义与 team_matches 完全一致（team_matches 现在就是它的薄封装）。
+    """
+    if not ta or not tb:
+        return False, 0
+    short, long_ = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    if not short.issubset(long_):
+        return False, 0
+    return True, len(short)
+
+
 def team_matches(a, b):
     """
     队名是否指同一支球队。返回 (是否匹配, 共享的具辨识度 token 数)。
@@ -84,13 +100,7 @@ def team_matches(a, b):
     规则：短名的 token 必须是长名 token 的子集，且共享 token 数 >= 1。
     （两个条件在剔除通用词后其实是等价的，但显式写出来便于审计。）
     """
-    ta, tb = _tokens(a), _tokens(b)
-    if not ta or not tb:
-        return False, 0
-    short, long_ = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
-    if not short.issubset(long_):
-        return False, 0
-    return True, len(short)
+    return _team_matches_tokens(_tokens(a), _tokens(b))
 
 
 def extract_market_team(question, group_title):
@@ -115,13 +125,63 @@ def extract_market_team(question, group_title):
     return None, None
 
 
-def match_market(question, group_title, league, end_dt, fixtures,
-                 max_day_gap=2.0):
+def prepare_fixture_index(fixtures, max_day_gap=2.0):
+    """
+    把 fixtures 预处理成可复用的索引（**只做一次，然后给所有市场共用**）。
+
+    ★★★ 2026-10-15：这是 run_match 的性能修复 ★★★
+      实测（14:05 那轮的真实日志）：
+          [match] 本次代价 = 6087 个市场 x 79 条赛程 = 最多 480,873 次比较
+          [match] 进度 1000/6087，已匹配 23，已用 139s
+        => 全量约需 845 秒，而这一步的预算是 417 秒 ⇒ **必然被截断，
+           匹配覆盖率实际只有约一半**。
+
+      原实现每一轮市场循环里都在重复做三件昂贵的、与市场无关的事：
+        (a) pd.to_datetime(f["commence_time"])  —— 48 万次日期解析
+        (b) _tokens(f["home"]) / _tokens(f["away"]) —— 正则 + 建集合
+        (c) 遍历**全部** 79 条赛程，而其中绝大多数连日期都对不上
+            （max_day_gap 只有 2 天）
+
+      这里把 (a)(b) 预计算一次，并按**日期分桶**解决 (c)：
+      每个市场只看 end_date 前后几天的桶，而不是全部赛程。
+
+      语义保证：分桶用的是一个**超集**（±ceil(max_day_gap)+1 天），
+      之后仍然用原来的精确 gap 判定 —— 所以结果与优化前逐字节相同，
+      这一点由 tests/test_regressions.py 里的等价性测试锁住。
+    """
+    span = int(max_day_gap) + 1
+    all_fx = []
+    by_date = {}
+    for f in fixtures:
+        try:
+            ct = pd.to_datetime(f["commence_time"], utc=True)
+        except Exception:
+            # 与原逻辑一致：解析不出的赛程永远匹配不上，直接排除
+            continue
+        rec = {"fid": f["fid"], "home": f["home"], "away": f["away"],
+               "_ct": ct, "_th": _tokens(f["home"]), "_ta": _tokens(f["away"])}
+        all_fx.append(rec)
+        try:
+            by_date.setdefault(ct.date(), []).append(rec)
+        except Exception:
+            pass
+    return {"all": all_fx, "by_date": by_date, "span": span}
+
+
+def match_market(question, group_title, league, end_dt, fixtures=None,
+                 max_day_gap=2.0, index=None):
     """
     把一个 Polymarket 市场匹配到 fixtures（同联赛）。
     fixtures: list of dict(fid, home, away, commence_time)
     返回最佳匹配 dict 或 None。
+
+    ★ index：由 prepare_fixture_index() 预先算好的索引。
+      **循环调用时一定要传 index**，否则每个市场都会重建一次索引（更慢）。
+      index=None 时会用 fixtures 就地建一份 —— 保持旧的单次调用方式可用。
     """
+    if index is None:
+        index = prepare_fixture_index(fixtures or [], max_day_gap=max_day_gap)
+
     team, method = extract_market_team(question, group_title)
     is_draw = (group_title or "").strip().lower() == "draw" or \
               re.search(r"\bdraw\b", question or "", re.I) is not None
@@ -137,31 +197,43 @@ def match_market(question, group_title, league, end_dt, fixtures,
         if not m:
             return None           # 解析不出对阵就不匹配（宁可漏）
         draw_teams = (m.group(1).strip(), m.group(2).strip())
+    if not is_draw:
+        tok_team = _tokens(team)
+
+    end_ts = None
+    if end_dt is not None:
+        end_ts = pd.to_datetime(end_dt, utc=True)
+    # 只取 end_date 前后几天的桶（超集），精确判定仍用原来的 gap 逻辑
+    if end_ts is not None and pd.notna(end_ts):
+        d0 = end_ts.date()
+        cands = []
+        for k in range(-index["span"], index["span"] + 1):
+            cands.extend(index["by_date"].get(d0 + dt.timedelta(days=k), ()))
+    else:
+        cands = index["all"]
 
     best = None
-    for f in fixtures:
-        try:
-            ct = pd.to_datetime(f["commence_time"], utc=True)
-        except Exception:
-            continue
-        gap = abs((pd.to_datetime(end_dt, utc=True) - ct).total_seconds()) / 86400.0 \
-            if end_dt is not None else 0.0
+    for f in cands:
+        ct = f["_ct"]
+        gap = abs((end_ts - ct).total_seconds()) / 86400.0 if end_ts is not None else 0.0
         if gap > max_day_gap:
             continue
         cand_side = None
         conf = 0.0
         if is_draw:
             a, b = draw_teams
-            ok1 = team_matches(a, f["home"])[0] and team_matches(b, f["away"])[0]
-            ok2 = team_matches(b, f["home"])[0] and team_matches(a, f["away"])[0]
+            ok1 = _team_matches_tokens(_tokens(a), f["_th"])[0] and \
+                _team_matches_tokens(_tokens(b), f["_ta"])[0]
+            ok2 = _team_matches_tokens(_tokens(b), f["_th"])[0] and \
+                _team_matches_tokens(_tokens(a), f["_ta"])[0]
             if ok1 or ok2:
                 conf = 0.75
                 cand_side = "draw"
             else:
                 continue          # ★ 队名对不上 ⇒ 拒绝
         else:
-            ok_h, nh = team_matches(team, f["home"])
-            ok_a, na = team_matches(team, f["away"])
+            ok_h, nh = _team_matches_tokens(tok_team, f["_th"])
+            ok_a, na = _team_matches_tokens(tok_team, f["_ta"])
             if ok_h and not ok_a:
                 cand_side, conf = "home", 0.6 + 0.2 * nh
             elif ok_a and not ok_h:
@@ -231,6 +303,15 @@ def run_match(verbose=True, min_conf=0.45, budget_sec=None):
         if budget_sec is not None:
             print("  [match] 预算 %.0fs" % budget_sec, flush=True)
 
+    # ★ 2026-10-15：索引**只建一次**，所有市场共用。
+    #   这正是把 480,873 次比较压下去的地方 —— 见 prepare_fixture_index。
+    t_idx = _time.time()
+    index = prepare_fixture_index(fixtures)
+    if verbose:
+        print("  [match] 索引已建：%d 条赛程 / %d 个日期桶，耗时 %.1fs"
+              % (len(index["all"]), len(index["by_date"]), _time.time() - t_idx),
+              flush=True)
+
     n_new, n_try = 0, 0
     truncated = False
     for _, r in ms.iterrows():
@@ -242,7 +323,7 @@ def run_match(verbose=True, min_conf=0.45, budget_sec=None):
             print("  [match] 进度 %d/%d，已匹配 %d，已用 %.0fs"
                   % (n_try, len(ms), n_new, _time.time() - _t0), flush=True)
         m = match_market(r["question"], r["group_title"], r["league"],
-                         r["end_date"], fixtures)
+                         r["end_date"], index=index)
         if not m or m["confidence"] < min_conf:
             continue
         conn.execute(

@@ -975,5 +975,127 @@ class TestRunLevelCoverageAlarm(unittest.TestCase):
                       "覆盖缺口的告警没有带上分母，无法区分普遍失败与零星失败")
 
 
+class TestMatchIndexEquivalence(unittest.TestCase):
+    """
+    bug #14（2026-10-15）：run_match 的 O(N x M) 让匹配覆盖率只有约一半。
+    ========================================================================
+    实测（14:05 那轮日志）：6087 个市场 x 79 条赛程 = 480,873 次比较，
+    进度 1000/6087 用了 139s ⇒ 全量约 845s，而这一步预算只有 417s
+    ⇒ **必然被截断，匹配覆盖率实际只有约一半**。
+
+    修法：预算一次赛程的解析时间与队名 token，并按日期分桶，
+    让每个市场只看 end_date 前后几天的桶（超集），再用原来的精确 gap 判定。
+
+    实测加速：4000 个市场 586.7s -> 5.3s（110.7x），
+    且**结果逐字节一致（0 处差异）**、匹配数 113 = 113。
+
+    这个类专门锁住"优化没有改变语义"和"确实不再全表扫描"。
+    """
+
+    def _fx(self, fid, home, away, ct):
+        return {"fid": fid, "sport_key": "soccer_x", "commence_time": ct,
+                "home": home, "away": away}
+
+    def test_index_path_matches_inline_path(self):
+        """
+        index= 与 fixtures= 两条路径必须给出完全一样的结果。
+        （run_match 走 index，其它调用者可能走 fixtures —— 不能有第二套语义。）
+        """
+        from polytrade import match as MT
+        fixtures = [
+            self._fx(1, "Arsenal", "Chelsea", "2026-10-16T14:00:00Z"),
+            self._fx(2, "Real Madrid", "Barcelona", "2026-10-17T19:00:00Z"),
+            self._fx(3, "Bayern Munich", "Dortmund", "2026-10-25T16:00:00Z"),
+        ]
+        idx = MT.prepare_fixture_index(fixtures)
+        cases = [
+            ("Will Arsenal win on 2026-10-16?", "Arsenal", "2026-10-16T12:00:00Z"),
+            ("Will Barcelona win on 2026-10-17?", "Barcelona", "2026-10-17T12:00:00Z"),
+            ("Draw (Bayern Munich vs. Dortmund)", "Draw", "2026-10-25T12:00:00Z"),
+            ("Will Liverpool win on 2026-10-16?", "Liverpool", "2026-10-16T12:00:00Z"),
+        ]
+        for q, gt, ed in cases:
+            a = MT.match_market(q, gt, "L", ed, fixtures=fixtures)
+            b = MT.match_market(q, gt, "L", ed, index=idx)
+            self.assertEqual(a, b, "两条路径结果不一致：\n  q=%s\n  fixtures=%s\n  index=%s"
+                             % (q, a, b))
+
+    def test_index_finds_fixtures_straddling_bucket_boundaries(self):
+        """
+        分桶必须用**超集**：赛程与 market end_date 跨了日历日、
+        但 gap < max_day_gap 时仍然必须被找到。
+        这正是"图省事只查同一天"会漏掉的情形。
+        """
+        from polytrade import match as MT
+        # 市场 end 在 10-18 23:30，赛程在 10-17 00:10 -> gap ≈ 1.97 天 < 2.0
+        fixtures = [self._fx(1, "Arsenal", "Chelsea", "2026-10-17T00:10:00Z")]
+        idx = MT.prepare_fixture_index(fixtures)
+        got = MT.match_market("Will Arsenal win?", "Arsenal",
+                              "L", "2026-10-18T23:30:00Z", index=idx)
+        self.assertIsNotNone(got, "跨日历日的赛程被分桶漏掉了（gap 仍 < 2 天）")
+        self.assertEqual(got["fid"], 1)
+        self.assertLessEqual(got["day_gap"], 2.0)
+
+    def test_index_excludes_fixtures_beyond_max_day_gap(self):
+        from polytrade import match as MT
+        fixtures = [self._fx(1, "Arsenal", "Chelsea", "2026-10-16T12:00:00Z")]
+        idx = MT.prepare_fixture_index(fixtures)
+        got = MT.match_market("Will Arsenal win?", "Arsenal",
+                              "L", "2026-10-20T12:00:00Z", index=idx)
+        self.assertIsNone(got, "gap 4 天的赛程不该被匹配")
+
+    def test_unparseable_fixture_time_is_skipped_like_before(self):
+        from polytrade import match as MT
+        fixtures = [self._fx(1, "Arsenal", "Chelsea", "not-a-date"),
+                    self._fx(2, "Arsenal", "Chelsea", "2026-10-16T12:00:00Z")]
+        idx = MT.prepare_fixture_index(fixtures)
+        self.assertEqual(len(idx["all"]), 1, "解析不出的赛程应当被排除")
+        got = MT.match_market("Will Arsenal win?", "Arsenal",
+                              "L", "2026-10-16T12:00:00Z", index=idx)
+        self.assertIsNotNone(got)
+        self.assertEqual(got["fid"], 2)
+
+    def test_end_dt_none_still_scans_everything(self):
+        """end_dt 为空时原逻辑不按日期过滤（gap=0），索引路径必须保持一致。"""
+        from polytrade import match as MT
+        fixtures = [self._fx(1, "Arsenal", "Chelsea", "2020-01-01T12:00:00Z")]
+        idx = MT.prepare_fixture_index(fixtures)
+        got = MT.match_market("Will Arsenal win?", "Arsenal", "L", None, index=idx)
+        self.assertIsNotNone(got, "end_dt=None 时应当回退到全表扫描")
+        self.assertEqual(got["fid"], 1)
+
+    def test_does_not_scan_every_fixture(self):
+        """
+        ★ 性能回归：索引化之后，匹配一个市场**不该**遍历全部赛程。
+        构造 1000 条远日期赛程 + 1 条当天的，数一下 token 比较被调用了几次。
+        若有人把索引去掉（退回全表扫描），这条会立刻失败。
+        """
+        from unittest import mock
+        from polytrade import match as MT
+        fixtures = [self._fx(i, "Team%d" % i, "Other%d" % i,
+                             "2020-01-%02dT12:00:00Z" % ((i % 28) + 1))
+                    for i in range(1000)]
+        fixtures.append(self._fx(9999, "Arsenal", "Chelsea", "2026-10-16T12:00:00Z"))
+        idx = MT.prepare_fixture_index(fixtures)
+        calls = {"n": 0}
+        real = MT._team_matches_tokens
+
+        def counting(a, b):
+            calls["n"] += 1
+            return real(a, b)
+
+        MT._team_matches_tokens = counting
+        try:
+            got = MT.match_market("Will Arsenal win?", "Arsenal",
+                                  "L", "2026-10-16T12:00:00Z", index=idx)
+        finally:
+            MT._team_matches_tokens = real
+        self.assertIsNotNone(got)
+        self.assertEqual(got["fid"], 9999)
+        self.assertLess(calls["n"], 50,
+                        "1001 条赛程里比较了 %d 次 —— 索引没有生效，"
+                        "又退回全表扫描了" % calls["n"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
