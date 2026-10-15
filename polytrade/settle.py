@@ -35,7 +35,7 @@ def _pick_market(j):
     return None
 
 
-def fetch_resolution(market_id):
+def fetch_resolution(market_id, tries=None, timeout=None):
     """
     返回 (closed: bool, outcome_yes: int|None, raw)。
 
@@ -61,7 +61,7 @@ def fetch_resolution(market_id):
         (C.GAMMA + "/markets", {"id": market_id}),               # 退路 2（仅未关闭市场）
     ):
         try:
-            m = _pick_market(_get(_url, _params))
+            m = _pick_market(_get(_url, _params, tries=tries, timeout=timeout))
         except Exception:
             m = None
         if m:
@@ -109,7 +109,7 @@ def settle_bets(verbose=True, sleep=0.0, workers=8):
     from concurrent.futures import ThreadPoolExecutor
 
     try:
-        _scan.assert_network()
+        _scan.assert_network(tries=1, timeout=C.SETTLE_HTTP_TIMEOUT_SEC)
     except Exception as e:
         if verbose:
             print("  [settle] ⚠ 网络不可达，本轮跳过结算（结算幂等，下轮自动补）：%s"
@@ -120,44 +120,60 @@ def settle_bets(verbose=True, sleep=0.0, workers=8):
     rows = conn.execute(
         "SELECT bet_id, market_id, side, entry_price, shares, stake FROM bets "
         "WHERE status='open'").fetchall()
+    # Repeated tickets on a legacy market share one oracle result. Fetch it once.
+    bets_by_market = {}
+    for row in rows:
+        bets_by_market.setdefault(str(row["market_id"]), []).append(row)
+    market_ids = list(bets_by_market)
+    deadline = time.monotonic() + max(1, C.SETTLE_TIME_BUDGET_SEC)
 
-    def one(r):
-        closed, oy, _ = fetch_resolution(r["market_id"])
-        return r, closed, oy
+    def one(market_id):
+        if time.monotonic() >= deadline:
+            return market_id, None, None, True
+        closed, oy, _ = fetch_resolution(
+            market_id, tries=1, timeout=C.SETTLE_HTTP_TIMEOUT_SEC)
+        return market_id, closed, oy, False
 
     results = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        results = list(ex.map(one, rows))
+        results = list(ex.map(one, market_ids))
 
     n_settled = 0
     n_pending = 0
-    for r, closed, oy in results:
-        if closed is None or not closed or oy is None:
-            n_pending += 1
+    n_budget_skipped = 0
+    for market_id, closed, oy, skipped in results:
+        if skipped:
+            n_budget_skipped += 1
+            n_pending += len(bets_by_market[market_id])
             continue
-        px = float(r["entry_price"])
-        shares = float(r["shares"])
-        stake = float(r["stake"])
-        fee = calc_fee(px, shares)
-        side = r["side"]
-        won = (oy == 0) if side == "NO" else (oy == 1)
-        gross = shares * 1.0 if won else 0.0
-        pnl = gross - stake - fee
-        conn.execute(
-            "UPDATE bets SET status='settled', outcome_yes=?, payout=?, fee=?, pnl=?, "
-            "settled_ts=? WHERE bet_id=?",
-            (oy, gross, fee, pnl, D.now_iso(), r["bet_id"]))
-        n_settled += 1
-        if verbose:
-            print("  [settle] %s side=%s px=%.3f yes=%d -> %s pnl=%+.4f"
-                  % (r["market_id"], side, px, oy, "WIN" if won else "LOSS", pnl),
-                  flush=True)
+        if closed is None or not closed or oy is None:
+            n_pending += len(bets_by_market[market_id])
+            continue
+        for r in bets_by_market[market_id]:
+            px = float(r["entry_price"])
+            shares = float(r["shares"])
+            stake = float(r["stake"])
+            fee = calc_fee(px, shares)
+            side = r["side"]
+            won = (oy == 0) if side == "NO" else (oy == 1)
+            gross = shares * 1.0 if won else 0.0
+            pnl = gross - stake - fee
+            conn.execute(
+                "UPDATE bets SET status='settled', outcome_yes=?, payout=?, fee=?, pnl=?, "
+                "settled_ts=? WHERE bet_id=?",
+                (oy, gross, fee, pnl, D.now_iso(), r["bet_id"]))
+            n_settled += 1
+            if verbose:
+                print("  [settle] %s side=%s px=%.3f yes=%d -> %s pnl=%+.4f"
+                      % (market_id, side, px, oy, "WIN" if won else "LOSS", pnl),
+                      flush=True)
     conn.commit()
     if verbose:
-        print("  [settle] 已结算 %d 笔，未到期 %d 笔" % (n_settled, n_pending),
-              flush=True)
-    if n_settled:
-        D.log_run(conn, "settle", n_settled=n_settled)
+        print("  [settle] 已结算 %d 笔，未到期/本轮未查 %d 笔（市场去重后查 %d 个；预算跳过 %d 个市场）"
+              % (n_settled, n_pending, len(market_ids), n_budget_skipped), flush=True)
+    note = "" if not n_budget_skipped else "time_budget markets_skipped=%d" % n_budget_skipped
+    if rows:
+        D.log_run(conn, "settle", n_settled=n_settled, note=note)
     conn.close()
     return n_settled
 

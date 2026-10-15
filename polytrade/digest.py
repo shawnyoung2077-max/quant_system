@@ -87,14 +87,8 @@ def health_check(conn=None, verbose=True):
     if not scans.empty:
         last_note = str(scans.iloc[0].get("note") or "")
         if last_note:
-            # ★ 2026-10-10：这里给 [提示] 而不是 [警告]。
-            #   MAX_PAGES_PER_TAG=10 是**已知且接受的取舍** ——
-            #   实测 53 个联赛会稳定打满（Bundesliga/LaLiga/CS2 ...）。
-            #   如果每轮都报"异常"，告警就变成噪音，人会开始无视它，
-            #   而那正是最初那个"静默少采"能藏两天的土壤。
-            #   真正要报警的是下面第 3 节的观测数突变。
-            issues.append("[提示] 本轮扫描有联赛打满页上限（已知取舍，非故障）：%s"
-                          % last_note)
+            severity = "严重" if "core_incomplete" in last_note else "警告"
+            issues.append("[%s] 本轮抓取存在覆盖缺口：%s" % (severity, last_note))
 
     # ---- 3. 观测数是否异常波动 ----
     obs_today = pd.read_sql_query(

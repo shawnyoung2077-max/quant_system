@@ -23,6 +23,7 @@ from . import config as C
 from . import db as D
 
 FETCH_COVERAGE_ISSUES = []
+FETCH_CORE_COMPLETE = False
 
 
 def _get(url, params=None, tries=None, timeout=None):
@@ -47,7 +48,7 @@ def _get(url, params=None, tries=None, timeout=None):
     return None
 
 
-def assert_network(verbose=False):
+def assert_network(verbose=False, tries=2, timeout=15):
     """
     网络预检：探一次 gamma-api，不可达就抛 RuntimeError（几秒内说清原因）。
 
@@ -62,7 +63,7 @@ def assert_network(verbose=False):
       结算本身是幂等的，本轮做不了下一轮再来即可，**没有理由死磕**。
     """
     _probe = _get(C.GAMMA + "/markets", {"limit": 1, "closed": "false"},
-                  tries=2, timeout=15)
+                  tries=tries, timeout=timeout)
     if not isinstance(_probe, list):
         raise RuntimeError(
             "Polymarket 不可达（预检失败：%s）。当前 PROXY=%s。"
@@ -92,8 +93,9 @@ def fetch_all_markets(verbose=True, workers=8, budget_sec=None):
       （总运行 494 秒）。改成 8 线程并发后约 60 秒。
       其余步骤（转 DataFrame / 筛选）总共只有 13 秒，不值得优化。
     """
-    global FETCH_COVERAGE_ISSUES
+    global FETCH_COVERAGE_ISSUES, FETCH_CORE_COMPLETE
     FETCH_COVERAGE_ISSUES = []
+    FETCH_CORE_COMPLETE = False
 
     # ★★ 2026-10-12 新增：网络预检，快速失败 ★★
     #   实际事故：代理（Clash Verge 的 verge-mihomo 内核）没在跑，
@@ -106,7 +108,8 @@ def fetch_all_markets(verbose=True, workers=8, budget_sec=None):
     # ★ 2026-10-15：抽成 assert_network() 供 settle 复用 —— 见那里的说明。
     assert_network()
 
-    cat = json.load(io.open(C.SPORTS_CATALOG, encoding="utf-8"))
+    with io.open(C.SPORTS_CATALOG, encoding="utf-8") as f:
+        cat = json.load(f)
     tags = []
     for c in cat:
         t = c.get("primaryTagId")
@@ -125,63 +128,92 @@ def fetch_all_markets(verbose=True, workers=8, budget_sec=None):
     import time as _time
     _t_start = _time.time()
     _budget_hit = {"v": False}
+    utc_now = dt.datetime.now(dt.timezone.utc)
+    core_date_min = (utc_now + dt.timedelta(days=C.MIN_DAYS)).isoformat(timespec="seconds").replace("+00:00", "Z")
+    core_date_max = (utc_now + dt.timedelta(days=C.MAX_DAYS)).isoformat(timespec="seconds").replace("+00:00", "Z")
+    core_types = sorted(x for x in C.BET_TYPES if x)
 
-    def one(item):
+    def fetch_core(item):
         t, nm = item
         out = []
-        # ★ 分页：单次请求最多只返回 100 条（limit=500 与 100 结果相同），
-        #   而一个热门联赛可能有 600+ 个未结算市场。某页不足满页即到底，提前停。
-        hit_page_cap = False
-        failed_page = False
-        skipped_by_budget = False
         for pg in range(max(1, C.MAX_PAGES_PER_TAG)):
-            # ★ 墙钟预算（2026-10-10）：定时任务的 ExecutionTimeLimit 是 30 分钟，
-            #   而 473 个 tag × 10 页最坏情况是 4,730 次请求。一旦代理抽风，
-            #   单次请求要重试 5 次 × 20s 超时 —— 那会把任务拖到被杀。
-            #   所以按墙钟截断，并且**必须上报**（写进 runs.note 交给看门狗）：
-            #   静默截断正是最初那个"联赛覆盖缺陷"能藏两天的原因。
             if _time.time() - _t_start > budget:
-                _budget_hit["v"] = True
-                skipped_by_budget = True
-                break
-            j = _get(C.GAMMA + "/markets",
-                     {"limit": C.MARKETS_PER_TAG,
-                      "offset": pg * C.MARKETS_PER_TAG,
-                      "closed": "false", "tag_id": t})
-            if not isinstance(j, list):
-                failed_page = True
-                break
-            if not j:
-                break
-            out += [(m.get("id") or m.get("conditionId"), m, nm) for m in j]
-            if len(j) < C.MARKETS_PER_TAG:
-                break
-            if pg == max(1, C.MAX_PAGES_PER_TAG) - 1:
-                hit_page_cap = True
-        return out, hit_page_cap, failed_page, skipped_by_budget
+                return out, "budget"
+            params = [
+                ("limit", C.MARKETS_PER_TAG), ("offset", pg * C.MARKETS_PER_TAG),
+                ("closed", "false"), ("tag_id", t),
+                ("end_date_min", core_date_min), ("end_date_max", core_date_max),
+                ("order", "endDate"), ("ascending", "true"),
+            ] + [("sports_market_types", typ) for typ in core_types]
+            page = _get(C.GAMMA + "/markets", params, tries=1, timeout=10)
+            if not isinstance(page, list):
+                return out, "api"
+            for m in page:
+                m["__core_candidate"] = True
+                out.append((m.get("id") or m.get("conditionId"), m, nm))
+            if len(page) < C.MARKETS_PER_TAG:
+                return out, None
+        return out, "page_cap"
+
+    def fetch_broad(item):
+        t, nm = item
+        out = []
+        for pg in range(max(1, C.MAX_PAGES_PER_TAG)):
+            if _time.time() - _t_start > budget:
+                return out, "budget", False
+            page = _get(C.GAMMA + "/markets",
+                        {"limit": C.MARKETS_PER_TAG, "offset": pg * C.MARKETS_PER_TAG,
+                         "closed": "false", "tag_id": t}, tries=1, timeout=10)
+            if not isinstance(page, list):
+                return out, "api", False
+            for m in page:
+                out.append((m.get("id") or m.get("conditionId"), m, nm))
+            if len(page) < C.MARKETS_PER_TAG:
+                return out, None, False
+        return out, None, True
 
     seen = {}
-    done = 0
-    failed_tags = []
-    capped_tags = []
-    skipped_tags = []
+    def merge(rows):
+        for key, market, league_name in rows:
+            if not key:
+                continue
+            if key in seen:
+                if market.get("__core_candidate"):
+                    seen[key]["__core_candidate"] = True
+                continue
+            market["__league_name"] = league_name
+            seen[key] = market
+
+    # 先保证模型真正能下注的候选覆盖，再用剩余预算做宽口径观测抓取。
+    # 这样宽扫触页数上限不会影响决策样本；任一核心 tag 不完整则本轮禁新注。
+    core_incomplete_tags, core_failed_tags = [], []
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for item, res in zip(tags, ex.map(one, tags)):
-            markets_for_tag, hit_cap, failed_page, skipped = res
-            if hit_cap:
-                capped_tags.append(item[1])
-            if failed_page:
-                failed_tags.append(item[1])
-            if skipped:
-                skipped_tags.append(item[1])
-            for k, m, nm in markets_for_tag:
-                if k and k not in seen:
-                    m["__league_name"] = nm
-                    seen[k] = m
-            done += 1
-            if verbose and done % 50 == 0:
-                print("  [scan] tag %d/%d, 累计 %d 个市场"
-                      % (done, len(tags), len(seen)), flush=True)
+        for item, (rows, issue) in zip(tags, ex.map(fetch_core, tags)):
+            merge(rows)
+            if issue:
+                core_incomplete_tags.append(item[1])
+                if issue == "api":
+                    core_failed_tags.append(item[1])
+                if issue == "budget":
+                    _budget_hit["v"] = True
+    FETCH_CORE_COMPLETE = not core_incomplete_tags
+    if not FETCH_CORE_COMPLETE:
+        FETCH_COVERAGE_ISSUES.append("core_incomplete tags=%d (%s)" %
+                                     (len(core_incomplete_tags), ", ".join(core_incomplete_tags[:12])))
+    if core_failed_tags:
+        FETCH_COVERAGE_ISSUES.append("core_api_errors tags=%d (%s)" %
+                                     (len(core_failed_tags), ", ".join(core_failed_tags[:12])))
+
+    capped_tags, failed_tags, skipped_tags = [], [], []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for i, (rows, issue, capped) in enumerate(ex.map(fetch_broad, tags)):
+            merge(rows)
+            if capped:
+                capped_tags.append(tags[i][1])
+            if issue == "api":
+                failed_tags.append(tags[i][1])
+            elif issue == "budget":
+                skipped_tags.append(tags[i][1])
     if skipped_tags:
         print("  [scan] ⚠ 墙钟预算 %ds 用尽，%d 个联赛被跳过（覆盖不完整）：%s"
               % (int(budget), len(skipped_tags),
@@ -195,6 +227,7 @@ def fetch_all_markets(verbose=True, workers=8, budget_sec=None):
     if capped_tags:
         FETCH_COVERAGE_ISSUES.append("page_cap tags=%d (%s)" %
                                      (len(capped_tags), ", ".join(capped_tags[:12])))
+        FETCH_COVERAGE_ISSUES.append("broad_snapshot_partial (strategy candidates fetched separately)")
     if failed_tags and verbose:
         print("  [scan] ⚠ %d 个联赛抓取中途遇到 API 错误，覆盖不完整：%s"
               % (len(failed_tags), ", ".join(failed_tags[:12])), flush=True)
@@ -266,6 +299,7 @@ def to_frame(markets):
                 "question": m.get("question") or "",
                 "league": m.get("__league_name") or "",
                 "market_type": m.get("sportsMarketType") or "",
+                "core_candidate": bool(m.get("__core_candidate")),
                 "group_title": m.get("groupItemTitle") or "",
                 "bid": bid, "ask": ask,
                 "mid": ((bid + ask) / 2) if (bid is not None and ask is not None) else None,
@@ -515,7 +549,11 @@ def run_scan(verbose=True, dry=False, budget_sec=None):
     # ★ 观测口径【宽收】：记录所有价格档（日后任何假设都能在同一份数据上检验）
     obs_cand = filter_candidates(df, verbose=verbose, wide=True)
     # 下注口径【窄】：只对明确规则的子集真下注
-    bet_cand = filter_candidates(df, verbose=verbose, wide=False)
+    bet_cand = filter_candidates(df[df["core_candidate"]], verbose=verbose, wide=False)
+    if not FETCH_CORE_COMPLETE:
+        if verbose:
+            print("  [scan] ⚠ 策略候选抓取不完整，本轮禁止新增纸面下注", flush=True)
+        bet_cand = bet_cand.iloc[0:0]
     cand = obs_cand
     if verbose:
         print("  [scan] 观测候选 %d 个 / 下注候选 %d 个（冷门联赛 %d 个）"
@@ -762,6 +800,7 @@ def run_scan(verbose=True, dry=False, budget_sec=None):
               note="; ".join(FETCH_COVERAGE_ISSUES)[:500])
     res = {"scanned": len(df), "obs_candidates": len(obs_cand),
            "bet_candidates": len(bet_cand), "n_cold_leagues": len(cold),
+           "core_complete": FETCH_CORE_COMPLETE,
            "n_obs": n_obs, "n_bets": n_bets}
     conn.close()
     return res

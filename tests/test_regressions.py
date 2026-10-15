@@ -732,6 +732,98 @@ class TestSettleFastFail(unittest.TestCase):
         finally:
             SC._get = real
 
+    def test_repeated_tickets_fetch_one_market_result(self):
+        import tempfile
+        from unittest.mock import patch
+        from polytrade import db as D
+        from polytrade import settle as SE
+        from polytrade import scan as SC
+        real_connect = D.connect
 
+        with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+            db_path = f.name
+        conn = real_connect(db_path)
+        conn.executemany(
+            "INSERT INTO bets (market_id, side, entry_price, shares, stake, status) "
+            "VALUES (?, ?, ?, ?, ?, 'open')",
+            [("same-market", "YES", 0.4, 2.5, 1.0),
+             ("same-market", "NO", 0.6, 2.5, 1.0)])
+        conn.commit()
+        conn.close()
+        try:
+            with patch.object(D, "connect", side_effect=lambda: real_connect(db_path)), \
+                 patch.object(SC, "assert_network"), \
+                 patch.object(SE, "fetch_resolution", return_value=(True, 1, {})) as fetch:
+                self.assertEqual(SE.settle_bets(verbose=False), 2)
+                self.assertEqual(fetch.call_count, 1)
+            conn = real_connect(db_path)
+            statuses = [r[0] for r in conn.execute("SELECT status FROM bets")]
+            conn.close()
+            self.assertEqual(statuses, ["settled", "settled"])
+        finally:
+            os.unlink(db_path)
+
+
+class TestCoreFetchCoverage(unittest.TestCase):
+    def test_strategy_markets_are_fetched_before_broad_snapshot(self):
+        import json
+        import tempfile
+        from unittest.mock import patch
+        from polytrade import scan as SC
+
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".json",
+                                         delete=False) as f:
+            json.dump([{"primaryTagId": "tag-1", "name": "League"}], f)
+            catalog_path = f.name
+        calls = []
+        market = {"id": "market-1", "sportsMarketType": "moneyline"}
+
+        def get(_url, params=None, **_kwargs):
+            params = dict(params or [])
+            calls.append(params)
+            if "end_date_min" in params:
+                return [market]
+            return []
+
+        try:
+            with patch.object(C, "SPORTS_CATALOG", catalog_path), \
+                 patch.object(C, "MAX_LEAGUE_TAGS", 0), \
+                 patch.object(C, "MAX_PAGES_PER_TAG", 2), \
+                 patch.object(C, "MARKETS_PER_TAG", 2), \
+                 patch.object(SC, "assert_network"), \
+                 patch.object(SC, "_get", side_effect=get):
+                rows = SC.fetch_all_markets(verbose=False, workers=1, budget_sec=5)
+            self.assertTrue(SC.FETCH_CORE_COMPLETE)
+            self.assertTrue(rows[0]["__core_candidate"])
+            self.assertIn("end_date_min", calls[0], "core strategy query must precede broad crawl")
+            self.assertNotIn("end_date_min", calls[-1])
+        finally:
+            os.unlink(catalog_path)
+
+    def test_core_page_cap_marks_coverage_incomplete(self):
+        import json
+        import tempfile
+        from unittest.mock import patch
+        from polytrade import scan as SC
+
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".json",
+                                         delete=False) as f:
+            json.dump([{"primaryTagId": "tag-1", "name": "League"}], f)
+            catalog_path = f.name
+        market = {"id": "market-1", "sportsMarketType": "moneyline"}
+        def get(_url, params=None, **_kwargs):
+            return [market] if "end_date_min" in dict(params or []) else []
+        try:
+            with patch.object(C, "SPORTS_CATALOG", catalog_path), \
+                 patch.object(C, "MAX_LEAGUE_TAGS", 0), \
+                 patch.object(C, "MAX_PAGES_PER_TAG", 1), \
+                 patch.object(C, "MARKETS_PER_TAG", 1), \
+                 patch.object(SC, "assert_network"), \
+                 patch.object(SC, "_get", side_effect=get):
+                SC.fetch_all_markets(verbose=False, workers=1, budget_sec=5)
+            self.assertFalse(SC.FETCH_CORE_COMPLETE)
+            self.assertTrue(any("core_incomplete" in issue for issue in SC.FETCH_COVERAGE_ISSUES))
+        finally:
+            os.unlink(catalog_path)
 if __name__ == "__main__":
     unittest.main(verbosity=2)

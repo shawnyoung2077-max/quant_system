@@ -432,6 +432,8 @@ MARKETS_PER_TAG = 100
 #   超预算时**按墙钟截断并写进 runs.note**（交给看门狗），绝不允许静默截断 ——
 #   静默少采正是联赛覆盖缺陷能藏两天的原因。实测正常耗时约 510 秒。
 FETCH_TIME_BUDGET_SEC = 720
+SETTLE_TIME_BUDGET_SEC = int(os.environ.get("POLYTRADE_SETTLE_TIME_BUDGET_SEC", "120"))
+SETTLE_HTTP_TIMEOUT_SEC = int(os.environ.get("POLYTRADE_SETTLE_HTTP_TIMEOUT_SEC", "8"))
 
 # ---------------------------------------------------------------------------
 # ★★★ 整轮运行的墙钟预算（2026-10-14 新增）★★★
@@ -527,7 +529,7 @@ BET_PRICE_LO = 0.05
 BET_PRICE_HI = 0.35
 BET_MAX_SPREAD = 0.06
 BET_TYPES = {
-    "moneyline", "", "child_moneyline", "first_half_moneyline",
+    "moneyline", "child_moneyline", "first_half_moneyline",
 }
 
 # ★★★ 2026-10-12 修：下注价格预筛必须**从 BET_RULES 推导**，不能各写各的 ★★★
