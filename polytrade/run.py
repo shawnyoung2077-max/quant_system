@@ -15,6 +15,39 @@ import os
 import sys
 import traceback
 
+# ---------------------------------------------------------------------------
+# ★★★ 2026-10-15：入口处**显式**把 stdout 设成「UTF-8 + 出错不抛」
+# ---------------------------------------------------------------------------
+# 背景（实测）：
+#   本机默认 ANSI 代码页是 cp936。当 stdout **被重定向到文件**时，
+#   Python 用的是 locale.getpreferredencoding(False) = cp936，
+#   **即 batch 里写 `chcp 65001` 也没用** —— 实测两种情况下
+#   sys.stdout.encoding 都是 'gbk'：
+#       不带 chcp：stdout.encoding = gbk
+#       带 chcp 65001：stdout.encoding = gbk      ← chcp 管的是控制台，不管重定向
+#   而我们的日志里有 ⚠ / ✓ / ✗ / ★ / → 这些**不在 GBK 里**的字符，
+#   print 它们会抛 UnicodeEncodeError。
+#
+# 之前为什么没炸？**纯属巧合**：report.py / digest.py / invariants.py /
+#   equity.py / match.py / refodds.py / aiforecast.py / papermm.py
+#   各自在模块层做了一次 `sys.stdout.reconfigure(errors="replace")`，
+#   谁先被 import 谁就把全局修好了。run.py 恰好 import 了它们，所以没事。
+#   polytrade.ensureproxy 只 import config，没这个副作用 —— 于是它一 print ✓ 就崩。
+#
+# ⇒ 这种"靠 import 副作用续命"的东西必须消灭：**编码安全要在入口显式建立**，
+#   而不是依赖某个模块恰好被导入。顺带把编码统一成 UTF-8，
+#   这样 cron.log 也能直接用 UTF-8 读（之前是 GBK，我为此误读过一次日志、
+#   还据此下了一个错误结论，见 docs/DEBUG_run_timeout_30min.md 第 5 节）。
+def _setup_stdout():
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_setup_stdout()
+
 
 def plan_fetch_budget(budget_left, reserve, cap):
     """
@@ -76,8 +109,17 @@ def main():
         return True
 
     def out(s):
+        # ★ 2026-10-15：print 失败**绝不允许**影响流程。
+        #   实测教训：out("[0/4] ⚠ 代理不可用 …") 被一层 try/except 包着，
+        #   而 stdout 是 GBK，print 抛 UnicodeEncodeError 被静默吞掉 ——
+        #   结果那一行**只进了 lines（写文件），没进 stdout（cron.log）**，
+        #   两条输出悄悄分叉。留痕函数的首要职责是"一定留得下"，
+        #   所以这里自己兜住异常，并且始终先 append 再 print。
         lines.append(str(s))
-        print(s, flush=True)
+        try:
+            print(s, flush=True)
+        except Exception:
+            pass
 
     try:
         # ★★ 2026-10-12 改顺序：结算提到扫描之前 ★★

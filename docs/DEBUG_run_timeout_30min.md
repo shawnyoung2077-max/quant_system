@@ -137,9 +137,40 @@ polytrade run @ 2026-10-14 10:36:39      ← 启动偏移只有约 2 秒
 
 ---
 
-## 6. 回归测试
+## 6. 后续（2026-10-15）：预算做对了，但被一个"死磕"的步骤吃光
 
-`tests/test_regressions.py::TestRunWallClockBudget`（9 条）：
+预算机制上线后的实测「扫描前已耗时」（正常只要 18~32 秒）：
+
+| 运行 | 扫描前已耗时 | 代理状态 | 后果 |
+| --- | --- | --- | --- |
+| 10-14 16:24 | 19s | 正常 | 全部步骤正常 |
+| 10-14 18:21 | 32s | 正常 | 全部步骤正常 |
+| 10-14 22:21 | 18s | 正常 | 全部步骤正常 |
+| 10-14 12:12 | 413s | **不可达** | 整轮失败 |
+| 10-15 09:58 | 439s | **不可达** | 整轮失败 |
+| 10-15 10:01 | **666s** | 开始时不在、随后恢复 | 成功，但**参照价与 AI 双双被跳过** |
+| 10-14 21:05 | 743s | 连接被重置 | 整轮失败 |
+| 10-14 14:28 | 1380s | **不可达** | 整轮失败 |
+
+根因：`settle_bets` 对每个 open 注各发一次请求，
+每次 `HTTP_RETRIES(5) × HTTP_TIMEOUT(40s)`，**没有预检、没有预算**。
+代理一挂，它就死磕十几分钟。
+
+最隐蔽的一条证据是 10-15 10:01 那次：代理在结算过程中恢复了，运行最终成功，
+但 settle 已经吃掉 666 秒，把预算挤到只剩 234 秒 ——
+**参照价和 AI 两步都被跳过**。"恢复了却什么都没多拿到"，比直接失败更难发现。
+
+修法：把 `fetch_all_markets` 里那份网络预检抽成 `scan.assert_network()`，
+`settle_bets` 开头调用它，不可达就立刻返回 0 并说明原因。
+结算天然幂等（按 `market_id` 查、已结算的不会再算），本轮做不了下轮再来即可。
+实测效果：不可达时 settle 从 400~1400 秒降到 **0.0 秒**。
+
+---
+
+## 7. 回归测试
+
+`tests/test_regressions.py::TestRunWallClockBudget`（9 条）+
+`TestSettleFastFail`（2 条）：
 
 | 测试 | 锁住的行为 |
 | --- | --- |
@@ -151,5 +182,7 @@ polytrade run @ 2026-10-14 10:36:39      ← 启动偏移只有约 2 秒
 | `test_step_budget_is_smaller_than_the_whole_run` | 单步上限必须严格小于整轮预算 |
 | `test_refodds_budget_stops_the_loop_and_records_it` | 参照价截断要落库 |
 | `test_match_budget_stops_the_loop_and_records_it` | 匹配截断要落库 |
+| `test_settle_fast_fails_when_network_is_down` | **网络不可达时 settle 必须 5 秒内放弃** |
+| `test_assert_network_exists_and_raises` | 预检是可复用函数，scan 与 settle 共用同一份判断 |
 
-合计 **107 条测试全绿**。
+合计 **115 条测试全绿**。

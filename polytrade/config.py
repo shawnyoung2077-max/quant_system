@@ -88,6 +88,10 @@ if PROXY:
 #        所以代理不受影响。
 #   另外：真要在无桌面环境里保代理，正解不是拉 GUI，而是让它**开机自启到桌面会话**。
 AUTO_START_PROXY = True
+# ★ 2026-10-15：无桌面会话用来"委托拉代理"的交互式任务名。
+#   它的主体是 polytrade_proxy_up.bat（跑 polytrade.ensureproxy），
+#   注册为 LogonType=Interactive（不需要账户密码），因此会跑在用户的桌面会话里。
+PROXY_HELPER_TASK = "polytrade_proxy_up"
 PROXY_EXE_CANDIDATES = [
     r"C:\Program Files\Clash Verge\clash-verge.exe",
     os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "clash-verge", "Clash Verge.exe"),
@@ -140,6 +144,26 @@ def _session_of_pid(pid):
         return int(s.value)
     except Exception:
         return None
+
+
+def _run_task(name):
+    """
+    用 `schtasks /Run` 触发一个已注册的计划任务；返回是否成功。
+
+    ★ 为什么用这个而不是别的：本机不是管理员，没法提权，
+      也没法用 CreateProcessAsUser 把一个进程塞进别的会话。
+      但 `schtasks /Run` 走的是计划任务服务，**可以**触发一个
+      LogonType=Interactive 的任务，让它跑在用户的桌面会话里 ——
+      这正是"把 GUI 拉到有桌面的地方"所需要的全部能力。
+    """
+    import subprocess
+    try:
+        r = subprocess.run(["schtasks", "/Run", "/TN", name],
+                           capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=30)
+        return r.returncode == 0
+    except Exception:
+        return False
 
 
 def _tasklist_sessions(image):
@@ -269,14 +293,48 @@ def ensure_proxy(wait_sec=45, verbose=True):
 
     # ★ 2026-10-13：非交互式会话（通常是会话 0）绝不允许拉起 GUI。
     #   在那里启动会得到一个看不见的窗口，而且会抢走单例锁，
-    #   把用户自己的 GUI 一起弄坏 —— 这正是今天那次事故。
+    #   把用户自己的 GUI 一起弄坏 —— 这正是那次事故。
+    #
+    # ★★★ 2026-10-15：光"拒绝"不够，改成"委托" ★★★
+    #   只拒绝的代价，实测 24 小时里 **4 次运行颗粒无收**
+    #   （10-14 12:12 / 14:28 / 21:05、10-15 09:58），
+    #   全部是「代理不在 + 本进程无桌面 ⇒ 没人能拉起 GUI」。
+    #   其中 09:58 那次结构性无解：机器 09:47 开机、用户 10:01 登录，
+    #   而任务是 09:58 触发的 —— 那一刻桌面上根本没人。
+    #
+    #   现在改为：委托给 polytrade_proxy_up 这个 **Interactive** 任务。
+    #   实测 `schtasks /Create /RU <user> /IT` **不需要账户密码**就能注册，
+    #   而且 `/Run` 会跑在用户登录的桌面会话里（实测 session=2）——
+    #   在那里启动 GUI 是合法的，托盘和窗口都正常。
+    #   所以：会话 0 **自己**永远不拉 GUI，但它可以请桌面会话里的任务去拉。
     if not interactive_session():
         if verbose:
-            print("  [proxy] ⚠ 端口未监听，但当前是**非交互式会话**（无桌面）——"
-                  "拒绝拉起 Clash Verge。", flush=True)
-            print("        原因：在无桌面会话里启动 GUI 会得到一个看不见的窗口，"
-                  "并抢走单例锁，导致用户点图标也打不开。", flush=True)
-            print("        请在桌面会话里手动启动 Clash Verge，或让它开机自启。", flush=True)
+            print("  [proxy] ⚠ 端口未监听，且本进程无桌面（会话 %s）——"
+                  "自己拉 GUI 会抢走单例锁，改为委托交互式任务 %s"
+                  % (_session_of_pid(os.getpid()), PROXY_HELPER_TASK), flush=True)
+        if not _run_task(PROXY_HELPER_TASK):
+            if verbose:
+                print("  [proxy] ✗ 无法触发辅助任务 %s（未注册？）—— "
+                      "请手动启动 Clash，或确认它的开机自启。" % PROXY_HELPER_TASK,
+                      flush=True)
+            return None
+        import time
+        t0 = time.time()
+        while time.time() - t0 < wait_sec:
+            time.sleep(2)
+            p = _detect_proxy()
+            if p:
+                PROXY = p
+                for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+                    os.environ[k] = p
+                if verbose:
+                    print("  [proxy] ✓ 委托成功：桌面会话里的辅助任务把代理拉起来了 "
+                          "%s（等了 %.0f 秒）" % (p, time.time() - t0), flush=True)
+                return p
+        if verbose:
+            print("  [proxy] ✗ 辅助任务在 %ds 内没能拉起代理 —— "
+                  "通常意味着**当前桌面上没人登录**，那就真的没人能启动 Clash 了"
+                  % wait_sec, flush=True)
         return None
 
     exe = next((x for x in PROXY_EXE_CANDIDATES if x and os.path.exists(x)), None)

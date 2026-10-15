@@ -358,12 +358,21 @@ class TestProxySessionGuard(unittest.TestCase):
         self.assertEqual(got, [(28540, 0), (777, 1)], "CSV 解析错了：%s" % got)
 
     def test_ensure_proxy_refuses_gui_in_session0(self):
-        """端到端：会话 0 里 ensure_proxy() 绝不能 Popen 出 GUI 进程。"""
+        """
+        端到端：会话 0 里 ensure_proxy() 绝不能 Popen 出 **GUI** 进程。
+
+        ★ 2026-10-15 修正断言：原来断言的是"任何 Popen 都不许发生"。
+        但修复"委托"之后，会话 0 会调用 `schtasks /Run polytrade_proxy_up`
+        （subprocess.run 内部就是 Popen），这是一个**合法且必要**的动作 ——
+        它恰恰是"不自己拉 GUI，而是请桌面会话去拉"。
+        所以这里要断言的是真正的不变量：**不许拉起 Clash 的 GUI 可执行文件**。
+        """
         import subprocess
         popen_calls = []
         restore = self._patch(_detect_proxy=lambda: None,
                               _session_of_pid=lambda pid: 0,
-                              _tasklist_sessions=lambda image: [])
+                              _tasklist_sessions=lambda image: [],
+                              _run_task=lambda name: False)
         old_popen = subprocess.Popen
         subprocess.Popen = lambda *a, **kw: popen_calls.append(a)
         try:
@@ -372,8 +381,11 @@ class TestProxySessionGuard(unittest.TestCase):
             subprocess.Popen = old_popen
             restore()
         self.assertIsNone(got)
-        self.assertEqual(popen_calls, [],
-                         "会话 0 里竟然拉起了 GUI —— 单例锁会被抢走：%s" % popen_calls)
+        gui_launch = [c for c in popen_calls
+                      if any("clash-verge" in str(x).lower() for x in c[0])]
+        self.assertEqual(gui_launch, [],
+                         "会话 0 里竟然拉起了 Clash GUI —— 单例锁会被抢走：%s"
+                         % gui_launch)
 
 
 class TestRunWallClockBudget(unittest.TestCase):
@@ -537,6 +549,188 @@ class TestRunWallClockBudget(unittest.TestCase):
         self.assertEqual(len(rows), 1, "预算截断没有落库 —— 又变成静默少采了")
         self.assertIn("time_budget", rows[0][1])
         self.assertIn("leagues_skipped=6", rows[0][1])
+
+
+class TestProxyDelegation(unittest.TestCase):
+    """
+    bug #9（2026-10-15）：无桌面会话"拒绝拉 GUI"之后，没人能救代理。
+    ========================================================================
+    实测代价：2026-10-14~15 的 24 小时里 **4 次运行颗粒无收**
+    （10-14 12:12 / 14:28 / 21:05、10-15 09:58），全是「代理不在 + 本进程无桌面」。
+    其中 09:58 那次结构性无解：机器 09:47 开机、用户 10:01 登录，任务 09:58 触发。
+
+    修法：会话 0 **自己**永远不拉 GUI（那会抢单例锁、弄坏用户的 Clash），
+    但可以**委托**给一个 LogonType=Interactive 的任务 polytrade_proxy_up ——
+    实测 `schtasks /Create /RU <user> /IT` 不需要账户密码，
+    且 `/Run` 会跑在用户的桌面会话里（实测 session=2）。
+    """
+
+    def test_delegates_to_helper_task_when_no_desktop(self):
+        """核心：无桌面 + 代理不在时，必须去触发辅助任务，而不是直接放弃。"""
+        names = ("_detect_proxy", "interactive_session", "_session_of_pid",
+                 "_tasklist_sessions", "_run_task", "kill_invisible_gui")
+        real = {n: getattr(C, n) for n in names}
+        calls = {"run_task": []}
+        state = {"proxy_up": False}
+
+        def fake_detect():
+            return "http://127.0.0.1:7897" if state["proxy_up"] else None
+
+        def fake_run_task(name):
+            calls["run_task"].append(name)
+            state["proxy_up"] = True          # 模拟"桌面会话那边真的拉起来了"
+            return True
+
+        saved_proxy = C.PROXY
+        C._detect_proxy = fake_detect
+        C.interactive_session = lambda: False
+        C._session_of_pid = lambda pid: 0
+        C._tasklist_sessions = lambda image: []
+        C.kill_invisible_gui = lambda verbose=True: []
+        C._run_task = fake_run_task
+        try:
+            got = C.ensure_proxy(wait_sec=10, verbose=False)
+        finally:
+            for n, f in real.items():
+                setattr(C, n, f)
+            C.PROXY = saved_proxy
+        self.assertEqual(calls["run_task"], [C.PROXY_HELPER_TASK],
+                         "没有委托给辅助任务：%s" % calls["run_task"])
+        self.assertEqual(got, "http://127.0.0.1:7897", "委托之后没把代理接上")
+
+    def test_returns_none_when_helper_task_cannot_be_run(self):
+        """辅助任务触发不了（未注册 / 无人登录）时，只能如实返回 None，不能崩。"""
+        names = ("_detect_proxy", "interactive_session", "_session_of_pid",
+                 "_tasklist_sessions", "_run_task", "kill_invisible_gui")
+        real = {n: getattr(C, n) for n in names}
+        saved_proxy = C.PROXY
+        C._detect_proxy = lambda: None
+        C.interactive_session = lambda: False
+        C._session_of_pid = lambda pid: 0
+        C._tasklist_sessions = lambda image: []
+        C.kill_invisible_gui = lambda verbose=True: []
+        C._run_task = lambda name: False
+        try:
+            got = C.ensure_proxy(wait_sec=1, verbose=False)
+        finally:
+            for n, f in real.items():
+                setattr(C, n, f)
+            C.PROXY = saved_proxy
+        self.assertIsNone(got)
+
+    def test_helper_task_module_exists_and_is_wired(self):
+        """辅助任务的载体必须真的存在、且名字和配置一致。"""
+        from polytrade import ensureproxy
+        self.assertTrue(callable(ensureproxy.main))
+        bat = os.path.join(ROOT, "polytrade_proxy_up.bat")
+        self.assertTrue(os.path.exists(bat), "缺少 %s —— 辅助任务没有载体" % bat)
+        with open(bat, encoding="utf-8", errors="replace") as fh:
+            body = fh.read()
+        self.assertIn("polytrade.ensureproxy", body)
+        self.assertEqual(C.PROXY_HELPER_TASK, "polytrade_proxy_up")
+
+
+class TestStdoutEncodingSafety(unittest.TestCase):
+    """
+    bug #10（2026-10-15）：GBK 的 stdout 让"留痕"这一步自己崩掉。
+    ========================================================================
+    实测：本机 ANSI 代码页是 cp936，stdout **重定向到文件**时
+    sys.stdout.encoding 就是 'gbk' —— batch 里 chcp 65001 也改不了
+    （chcp 管控制台，不管重定向）：
+        不带 chcp      : stdout.encoding = gbk
+        带 chcp 65001  : stdout.encoding = gbk
+    而日志里有 ⚠ ✓ ✗ ★ → 这些不在 GBK 里的字符，print 会抛 UnicodeEncodeError。
+
+    之前没炸是**巧合**：report/digest/invariants/equity/match/refodds/
+    aiforecast/papermm 各自在模块层 reconfigure 了一次，谁先被 import 谁修好全局。
+    run.py 恰好 import 了它们；polytrade.ensureproxy 只 import config，于是崩了。
+
+    所以：编码安全必须**在入口显式建立**，不能靠 import 副作用续命。
+    """
+
+    def _run_with_gbk_stdout(self, import_stmt):
+        import subprocess
+        code = (
+            "import sys\n"
+            "sys.stdout.reconfigure(encoding='gbk')\n"   # 模拟重定向到文件时的真实情况
+            "%s\n"
+            "print('\\u26a0 \\u2713 \\u2717 \\u2605 \\u2192')\n"
+            "print('NO_CRASH')\n" % import_stmt
+        )
+        env = dict(os.environ)
+        env.pop("PYTHONIOENCODING", None)
+        env.pop("PYTHONUTF8", None)
+        return subprocess.run([sys.executable, "-c", code],
+                              capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", env=env,
+                              cwd=ROOT, timeout=180)
+
+    def test_run_entry_point_survives_gbk_stdout(self):
+        r = self._run_with_gbk_stdout("import polytrade.run")
+        self.assertIn("NO_CRASH", r.stdout or "",
+                      "导入 polytrade.run 之后仍无法在 GBK stdout 上打印符号：%s"
+                      % (r.stderr or "")[:300])
+
+    def test_ensureproxy_entry_point_survives_gbk_stdout(self):
+        r = self._run_with_gbk_stdout("import polytrade.ensureproxy")
+        self.assertIn("NO_CRASH", r.stdout or "",
+                      "导入 polytrade.ensureproxy 之后仍无法在 GBK stdout 上打印符号：%s"
+                      % (r.stderr or "")[:300])
+
+    def test_out_never_raises_even_if_print_fails(self):
+        """
+        run.out() 的首要职责是"一定留得下"。
+        实测教训：out() 先 append 再 print，print 抛异常被外层 try 吞掉，
+        于是那一行**只进了文件、没进 stdout**，两条输出悄悄分叉。
+        """
+        import inspect
+        from polytrade import run as RUN
+        src = inspect.getsource(RUN.main)
+        i = src.index("def out(s)")
+        self.assertIn("except Exception", src[i:i + 600],
+                      "out() 没有兜住 print 异常 —— 留痕会随编码问题一起消失")
+
+
+class TestSettleFastFail(unittest.TestCase):
+    """
+    bug #11（2026-10-15）：代理不在时 settle 死磕，烧掉 400~1400 秒。
+    ========================================================================
+    实测「扫描前已耗时」（正常只要 18~32 秒）：
+        413 / 439 / 666 / 743 / 1380 秒
+    两层后果：
+      1) 代理真挂掉的那几次，整轮白跑 10~23 分钟才失败；
+      2) 10-15 10:01 那次代理刚好恢复，settle 吃掉 666 秒，
+         把参照价和 AI 的预算全挤掉（两步双双被跳过）—— "恢复了却什么都没多拿到"。
+    结算天然幂等，本轮查不了下轮再来即可，没有理由死磕。
+    """
+
+    def test_settle_fast_fails_when_network_is_down(self):
+        import time
+        from polytrade import settle as SE
+        from polytrade import scan as SC
+        real = SC._get
+        SC._get = lambda *a, **kw: {"__err__": "stub: connection refused"}
+        try:
+            t0 = time.time()
+            n = SE.settle_bets(verbose=False)
+            dt = time.time() - t0
+        finally:
+            SC._get = real
+        self.assertEqual(n, 0)
+        self.assertLess(dt, 5.0,
+                        "网络不可达时 settle 没有快速失败，耗时 %.1fs" % dt)
+
+    def test_assert_network_exists_and_raises(self):
+        """预检必须是一个可复用的函数（settle 和 scan 共用同一份判断）。"""
+        from polytrade import scan as SC
+        self.assertTrue(callable(SC.assert_network))
+        real = SC._get
+        SC._get = lambda *a, **kw: {"__err__": "stub"}
+        try:
+            with self.assertRaises(RuntimeError):
+                SC.assert_network()
+        finally:
+            SC._get = real
 
 
 if __name__ == "__main__":

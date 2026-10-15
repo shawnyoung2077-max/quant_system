@@ -47,6 +47,31 @@ def _get(url, params=None, tries=None, timeout=None):
     return None
 
 
+def assert_network(verbose=False):
+    """
+    网络预检：探一次 gamma-api，不可达就抛 RuntimeError（几秒内说清原因）。
+
+    ★ 2026-10-15 从 fetch_all_markets 里抽出来，因为 **settle 也需要它**。
+      实测：代理不在时，settle 会对每个 open 注各发一次请求，
+      每次 5 次重试 x 40s 超时 —— 实测「扫描前已耗时」达到
+      413 / 439 / 666 / 743 / 1380 秒（正常只有 18~32 秒）。
+      后果有两层：
+        1) 代理真的挂掉的那几次，整轮白跑 10~23 分钟才失败；
+        2) 代理刚好恢复的那次（10-15 10:01），settle 吃掉 666 秒，
+           把参照价和 AI 的预算全挤没了 —— 于是"恢复了但什么都没多拿到"。
+      结算本身是幂等的，本轮做不了下一轮再来即可，**没有理由死磕**。
+    """
+    _probe = _get(C.GAMMA + "/markets", {"limit": 1, "closed": "false"},
+                  tries=2, timeout=15)
+    if not isinstance(_probe, list):
+        raise RuntimeError(
+            "Polymarket 不可达（预检失败：%s）。当前 PROXY=%s。"
+            "最常见原因：Clash Verge 没启动 —— 它不跑，7897 端口就不监听。"
+            % (_probe, C.PROXY or "未检测到代理（7897/7890 都未监听）"))
+    if verbose:
+        print("  [net] 预检通过（gamma-api 可达）", flush=True)
+
+
 def fetch_all_markets(verbose=True, workers=8, budget_sec=None):
     """
     抓取全部联赛的市场。
@@ -77,13 +102,9 @@ def fetch_all_markets(verbose=True, workers=8, budget_sec=None):
     #   整个 run.py 在第 1 步就崩，第 4 步的报告/看门狗永远不执行，
     #   结果**系统静默死了 36 小时**，直到用户问起才发现。
     #   现在先探一次：不可达就立刻抛明确错误，几秒内说清原因。
-    _probe = _get(C.GAMMA + "/markets", {"limit": 1, "closed": "false"},
-                  tries=2, timeout=15)
-    if not isinstance(_probe, list):
-        raise RuntimeError(
-            "Polymarket 不可达（预检失败：%s）。当前 PROXY=%s。"
-            "最常见原因：Clash Verge 没启动 —— 它不跑，7897 端口就不监听。"
-            % (_probe, C.PROXY or "未检测到代理（7897/7890 都未监听）"))
+    #
+    # ★ 2026-10-15：抽成 assert_network() 供 settle 复用 —— 见那里的说明。
+    assert_network()
 
     cat = json.load(io.open(C.SPORTS_CATALOG, encoding="utf-8"))
     tags = []

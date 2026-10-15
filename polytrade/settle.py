@@ -23,6 +23,7 @@ import datetime as dt
 from . import config as C
 from . import db as D
 from .scan import _get, calc_fee
+from . import scan as _scan
 
 
 def _pick_market(j):
@@ -92,8 +93,28 @@ def settle_bets(verbose=True, sleep=0.0, workers=8):
     ★ 性能：原先逐笔串行 + 每笔 sleep 0.25s，100 笔要 25 秒以上的纯等待。
       改成 8 线程并发（默认 sleep=0）。结算幂等（只按 market_id 查询），
       并发不会造成竞态。
+
+    ★★★ 2026-10-15：加网络预检，快速失败 ★★★
+      实测事故：代理不在时这一步会**死磕** —— 每个 open 注各发一次请求，
+      每次 HTTP_RETRIES(5) x HTTP_TIMEOUT(40s)。
+      日志里「扫描前已耗时」实测值（正常只要 18~32 秒）：
+          413s / 439s / 666s / 743s / 1380s
+      其中 10-15 10:01 那次代理刚好恢复，settle 吃掉 666 秒，
+      把参照价和 AI 的预算全挤掉（两个步骤双双被跳过）——
+      "恢复了却什么都没多拿到"。
+      结算天然幂等（按 market_id 查，已结算的不会再算），
+      本轮查不了下一轮再来就行，**完全没必要死磕**。
+      所以：先探一次，不可达就立刻返回并说明，把时间留给别的步骤。
     """
     from concurrent.futures import ThreadPoolExecutor
+
+    try:
+        _scan.assert_network()
+    except Exception as e:
+        if verbose:
+            print("  [settle] ⚠ 网络不可达，本轮跳过结算（结算幂等，下轮自动补）：%s"
+                  % str(e)[:180], flush=True)
+        return 0
 
     conn = D.connect()
     rows = conn.execute(

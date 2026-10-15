@@ -207,8 +207,121 @@ C:\Users\26050\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\Cla
 
 **不做**「会话 0 里端口没监听就直接拉无界面的 `verge-mihomo.exe`」兜底（用户已否决）。
 理由：`verge-mihomo.exe` 现在是 `clash_verge_service` 管的，再起一个会抢同一个端口，
-需要一整套互斥/接管判断，风险大于收益；打开开机自启之后覆盖率已经足够。
+需要一整套互斥/接管判断，风险大于收益。
 
 **不做**「会话号 != 桌面会话就杀 GUI」的宽判据。本机实测有两个桌面会话
 （explorer 在会话 1 和会话 2 各一个），宽判据会误杀用户正在用的 GUI。
+
+---
+
+## 10. ★★★ 后续（2026-10-15）：光"拒绝"不够，改成"委托" ★★★
+
+### 10.1 只拒绝的代价：24 小时里 4 次运行颗粒无收
+
+第 4 节的修复（拒绝在无桌面会话拉 GUI）+ 第 8 节的开机自启，**实测证明不够**：
+
+| 时间 | 结果 | 说明 |
+| --- | --- | --- |
+| 10-14 12:12 | 失败 | 代理未检测到（用户当天还没重新登录，自启快捷方式没机会跑） |
+| 10-14 14:28 | 失败 | 代理未检测到 |
+| 10-14 21:05 | 失败 | 代理在，但连接被重置 |
+| 10-15 09:58 | 失败 | **结构性无解**：机器 09:47 开机、用户 10:01 登录，任务 09:58 触发 |
+
+⇒ 我此前判断的「打开开机自启之后覆盖率已经足够」**是错的**，已作废。
+
+### 10.2 修法：会话 0 不自己拉 GUI，但可以**请桌面会话去拉**
+
+关键发现（实测，不需要管理员、不需要账户密码）：
+
+```
+schtasks /Create /TN <name> /TR <bat> /SC ONCE /ST 23:59 /RU "young\蔡向阳" /IT /F
+  -> SUCCESS（**全程没有要求密码**）
+  -> LogonType = Interactive
+schtasks /Run /TN <name>
+  -> 任务跑在 **Session=2**（用户的桌面会话）
+```
+
+也就是说：`schtasks /Run` 走的是计划任务服务（SYSTEM），
+**谁调用它、在哪个会话调用它都不重要** —— 它能把一个 Interactive 任务
+放进用户的桌面会话里执行。这正是"把 GUI 拉到有桌面的地方"所需的全部能力。
+
+实现：
+
+- 新入口 `polytrade/ensureproxy.py` + `polytrade_proxy_up.bat`（只做一件事：保证代理可用）；
+- 计划任务 `polytrade_proxy_up`（Interactive，`/SC ONCE` 挂在 23:59 上，平时不会自己触发）；
+- `config.ensure_proxy()` 在「无桌面 + 端口没监听」时不再直接放弃，而是
+  `schtasks /Run polytrade_proxy_up`，然后轮询等待代理起来。
+
+**端到端实测**（把 `polytrade_run.bat` 临时换成探针，触发真正的会话 0 任务）：
+
+```
+SESSION          = 0
+interactive      = False
+  [proxy] ⚠ 端口未监听，且本进程无桌面（会话 0）——自己拉 GUI 会抢走单例锁，
+          改为委托交互式任务 polytrade_proxy_up
+  [proxy] ✗ 辅助任务在 30s 内没能拉起代理 —— 通常意味着**当前桌面上没人登录**
+--- 同时 proxy_up.log 里出现了 ---
+[ensureproxy] 在 Session=2 里尝试保证代理可用
+[ensureproxy] ✓ 代理已就绪: http://127.0.0.1:7897
+```
+
+⇒ 会话 0 → schtasks → **桌面会话（Session=2）** 这条链路真的通了
+（探针里代理"拉不起来"是因为我把候选端口指到了没人监听的 7999，
+故意让它走委托分支，真实的 7897 全程未受影响）。
+
+至此仍然**未被实测**的只剩最后一小步：桌面会话里"端口真的没监听时启动 GUI"。
+那是 `ensure_proxy` 原本就有的路径（10-13 那次误启动证明了它确实能拉起 Clash），
+只是当时跑在了错误的会话里；现在它跑在正确的会话里。
+验证它需要真的杀掉用户的 Clash，代价不值得，故**如实标注为未验证**。
+
+### 10.3 一个必须注明的机器级改动
+
+`polytrade_proxy_up` 是**注册在系统里的计划任务**，不在 git 仓库里。
+换机器或重装后要重新注册：
+
+```powershell
+schtasks /Create /TN "polytrade_proxy_up" /SC ONCE /ST 23:59 /RU "<用户名>" /IT /F `
+  /TR "D:\26050\Documents\quant_system\polytrade_proxy_up.bat"
+```
+
+---
+
+## 11. 顺带修掉的两个"留痕"类 bug（2026-10-15）
+
+### 11.1 GBK 的 stdout 会让"留痕"这一步自己崩掉
+
+实测：本机 ANSI 代码页是 cp936，stdout **重定向到文件**时
+`sys.stdout.encoding` 就是 `gbk` —— **batch 里写 `chcp 65001` 也改不了**
+（chcp 管控制台，不管重定向）：
+
+```
+不带 chcp      : stdout.encoding = gbk
+带 chcp 65001  : stdout.encoding = gbk
+```
+
+而日志里有 ⚠ ✓ ✗ ★ → 这些**不在 GBK 里**的字符，`print` 会抛 `UnicodeEncodeError`。
+
+**之前为什么没炸？纯属巧合。** `report.py` / `digest.py` / `invariants.py` /
+`equity.py` / `match.py` / `refodds.py` / `aiforecast.py` / `papermm.py`
+各自在模块层做了一次 `sys.stdout.reconfigure(errors="replace")` ——
+谁先被 import，谁就顺手把全局修好了。`run.py` 恰好 import 了它们；
+而新的 `polytrade.ensureproxy` 只 import `config`，于是它一 print `✓` 就崩：
+
+```
+UnicodeEncodeError: 'gbk' codec can't encode character '\u2713'
+```
+
+修法：在**入口显式**建立编码安全（`run.py` / `ensureproxy.py` 顶部
+统一 `reconfigure(encoding="utf-8", errors="replace")`），
+不再依赖 import 副作用。顺带把日志统一成 UTF-8
+（旧的 GBK `cron.log` 已归档为 `cron_20261015_gbk.log`）——
+之前正是这份 GBK + 缓冲的日志让我误读、并据此下了一个错误结论
+（见 `DEBUG_run_timeout_30min.md` 第 5 节）。
+
+### 11.2 `out()` 在 print 失败时会"两条输出悄悄分叉"
+
+`run.out()` 原本是"先 append 到内存列表、再 print"。stdout 是 GBK 时，
+print 抛异常，而调用点外面包着 `try/except Exception: pass` —— 于是那一行
+**只进了写文件的 `lines`，没进 stdout（cron.log）**。
+留痕函数的首要职责是"一定留得下"，所以现在 `out()` 自己兜住 print 异常。
 
