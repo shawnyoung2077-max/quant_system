@@ -825,5 +825,81 @@ class TestCoreFetchCoverage(unittest.TestCase):
             self.assertTrue(any("core_incomplete" in issue for issue in SC.FETCH_COVERAGE_ISSUES))
         finally:
             os.unlink(catalog_path)
+
+
+class TestCoreCandidateGuard(unittest.TestCase):
+    """
+    bug #12（2026-10-15）：核心抓取「静默变空」会让系统一切正常地停止下注。
+    ========================================================================
+    实测（直接打真实 gamma API）：
+        sports_market_types=moneyline -> n=20（正常）
+        sports_market_types=zzz      -> n=0   （**不是报错**，是空列表）
+        zzzparam=1（未知参数名）      -> 与不传一样（**被静默忽略**）
+    于是 fetch_core 把「空列表」和「正常抓到底」返回成同一个 issue=None，
+    FETCH_CORE_COMPLETE 照样为 True、简报一切正常 —— 但永远没有下注候选。
+
+    还实测到两条隐式耦合，必须锁住，否则后人一「简化」就炸：
+        end_date_min/max 单独用                  -> HTTP 500
+        end_date_min/max + sports_market_types   -> 正常（63 个，63/63 在窗口内）
+        child_moneyline / first_half_moneyline 作过滤值 -> n=0（死值）
+    """
+
+    def test_core_min_candidates_threshold_is_low_and_positive(self):
+        """阈值只能用来抓「整块塌掉」，不能变成日常噪音。"""
+        self.assertGreater(C.CORE_MIN_CANDIDATES, 0, "阈值为 0 等于没有守卫")
+        self.assertLessEqual(
+            C.CORE_MIN_CANDIDATES, 100,
+            "阈值 %d 太高会把正常日子误报成故障（正常核心候选是几百到上千）"
+            % C.CORE_MIN_CANDIDATES)
+
+    def test_core_candidates_are_tracked_globally(self):
+        """核心候选数必须被记录，否则「过少」这件事没有任何入口能发现。"""
+        from polytrade import scan as SC
+        self.assertTrue(hasattr(SC, "FETCH_CORE_CANDIDATES"))
+
+    def test_empty_core_is_recorded_as_an_issue(self):
+        """
+        核心候选为 0 时必须写进 FETCH_COVERAGE_ISSUES（进而进 runs.note 和简报）。
+        构造的正是「取值失效」的真实形态：fetch_core 全部返回空列表且 issue=None。
+        """
+        from unittest import mock
+        from polytrade import scan as SC
+        with mock.patch.object(SC, "_get", return_value=[]):
+            with mock.patch.object(SC, "assert_network", return_value=None):
+                try:
+                    SC.fetch_all_markets(verbose=False, workers=1, budget_sec=5)
+                except Exception:
+                    pass   # 后续步骤可能因数据不足报错，这里只关心 coverage issues
+        notes = " ".join(SC.FETCH_COVERAGE_ISSUES)
+        self.assertIn("core_empty", notes,
+                      "核心候选为 0 竟然没有被记录 —— 系统会静默停注：%s" % notes)
+
+    def test_digest_grades_core_breakage_as_severe(self):
+        """
+        简报分级：「决策样本不可信」才该是严重，宽扫缺口只能是提示。
+        否则 page_cap（每轮 50+ 联赛）会让简报每轮报警，告警变噪音 ——
+        而那正是「静默少采能藏两天」的土壤。
+        """
+        import inspect
+        from polytrade import digest as DG
+        src = inspect.getsource(DG.health_check)
+        self.assertIn("core_empty", src, "digest 不认识 core_empty，静默停注不会被告警")
+        self.assertIn("core_incomplete", src)
+        i = src.find("core_incomplete")
+        self.assertIn("提示", src[i:i + 900],
+                      "宽扫缺口没有被降级为提示 —— 简报会每轮报警")
+
+    def test_bet_candidates_blocked_when_core_is_too_small(self):
+        """
+        核心候选过少时必须禁止下注。
+        若只剩几个候选还照常下注，等于在一个有偏的小子集上下注，比不下注更糟。
+        """
+        import inspect
+        from polytrade import scan as SC
+        src = inspect.getsource(SC.run_scan)
+        self.assertIn("CORE_MIN_CANDIDATES", src,
+                      "run_scan 没有用候选数量守卫拦住下注")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

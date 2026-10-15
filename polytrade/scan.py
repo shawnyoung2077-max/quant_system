@@ -24,6 +24,7 @@ from . import db as D
 
 FETCH_COVERAGE_ISSUES = []
 FETCH_CORE_COMPLETE = False
+FETCH_CORE_CANDIDATES = 0
 
 
 def _get(url, params=None, tries=None, timeout=None):
@@ -93,9 +94,10 @@ def fetch_all_markets(verbose=True, workers=8, budget_sec=None):
       （总运行 494 秒）。改成 8 线程并发后约 60 秒。
       其余步骤（转 DataFrame / 筛选）总共只有 13 秒，不值得优化。
     """
-    global FETCH_COVERAGE_ISSUES, FETCH_CORE_COMPLETE
+    global FETCH_COVERAGE_ISSUES, FETCH_CORE_COMPLETE, FETCH_CORE_CANDIDATES
     FETCH_COVERAGE_ISSUES = []
     FETCH_CORE_COMPLETE = False
+    FETCH_CORE_CANDIDATES = 0
 
     # ★★ 2026-10-12 新增：网络预检，快速失败 ★★
     #   实际事故：代理（Clash Verge 的 verge-mihomo 内核）没在跑，
@@ -187,6 +189,7 @@ def fetch_all_markets(verbose=True, workers=8, budget_sec=None):
     # 先保证模型真正能下注的候选覆盖，再用剩余预算做宽口径观测抓取。
     # 这样宽扫触页数上限不会影响决策样本；任一核心 tag 不完整则本轮禁新注。
     core_incomplete_tags, core_failed_tags = [], []
+    n_core_before = len(seen)
     with ThreadPoolExecutor(max_workers=workers) as ex:
         for item, (rows, issue) in zip(tags, ex.map(fetch_core, tags)):
             merge(rows)
@@ -197,12 +200,36 @@ def fetch_all_markets(verbose=True, workers=8, budget_sec=None):
                 if issue == "budget":
                     _budget_hit["v"] = True
     FETCH_CORE_COMPLETE = not core_incomplete_tags
+    n_core = len(seen) - n_core_before
+    FETCH_CORE_CANDIDATES = n_core
     if not FETCH_CORE_COMPLETE:
         FETCH_COVERAGE_ISSUES.append("core_incomplete tags=%d (%s)" %
                                      (len(core_incomplete_tags), ", ".join(core_incomplete_tags[:12])))
     if core_failed_tags:
         FETCH_COVERAGE_ISSUES.append("core_api_errors tags=%d (%s)" %
                                      (len(core_failed_tags), ", ".join(core_failed_tags[:12])))
+    # ★★★ 2026-10-15 新增：核心抓取"静默变空"的守卫 ★★★
+    #   实测（直接打真实 gamma API）：把一个非法的 sports_market_types 值传进去，
+    #   gamma **不报错，只返回空列表**：
+    #       sports_market_types=moneyline -> n=20（正常）
+    #       sports_market_types=zzz      -> n=0
+    #   而 fetch_core 对"空列表"和"正常到底"是同一个返回（issue=None），
+    #   于是 FETCH_CORE_COMPLETE 照样是 True、简报一切正常 ——
+    #   **但永远没有下注候选，系统会"一切正常地"停止下注。**
+    #   这正是本项目被坑过 4 次的同一类静默失败，所以必须显式守卫。
+    #
+    #   注意这个阈值的作用范围：它**只用来抓"整块塌掉"这种灾难**，
+    #   不是覆盖率达标线（正常一天核心候选是几百到上千个）。
+    #   定得低是为了不产生假警报 —— 告警一旦变成噪音就没人看了。
+    if n_core < C.CORE_MIN_CANDIDATES:
+        FETCH_COVERAGE_ISSUES.append(
+            "core_empty candidates=%d (<%d)" % (n_core, C.CORE_MIN_CANDIDATES))
+        if verbose:
+            print("  [scan] ⚠⚠ 核心候选只有 %d 个（阈值 %d）—— 极可能是"
+                  "sports_market_types 取值失效导致整块塌掉，本轮不会有下注候选"
+                  % (n_core, C.CORE_MIN_CANDIDATES), flush=True)
+    elif verbose:
+        print("  [scan] 核心候选 %d 个（策略下注只从这里出）" % n_core, flush=True)
 
     capped_tags, failed_tags, skipped_tags = [], [], []
     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -550,9 +577,18 @@ def run_scan(verbose=True, dry=False, budget_sec=None):
     obs_cand = filter_candidates(df, verbose=verbose, wide=True)
     # 下注口径【窄】：只对明确规则的子集真下注
     bet_cand = filter_candidates(df[df["core_candidate"]], verbose=verbose, wide=False)
-    if not FETCH_CORE_COMPLETE:
+    # ★ 2026-10-15：两道都要拦 ——
+    #   不完整：某个 tag 没抓完，候选集有洞；
+    #   过少：核心整块塌掉（例如 sports_market_types 取值失效返回空列表，
+    #         此时 FETCH_CORE_COMPLETE 仍是 True，光靠它拦不住）。
+    #   过少时若还剩几个候选就照常下注，等于在一个有偏的小子集上下注，
+    #   比不下注更糟 —— 所以宁可空一轮。
+    if not FETCH_CORE_COMPLETE or FETCH_CORE_CANDIDATES < C.CORE_MIN_CANDIDATES:
         if verbose:
-            print("  [scan] ⚠ 策略候选抓取不完整，本轮禁止新增纸面下注", flush=True)
+            print("  [scan] ⚠ 策略候选不可信（完整=%s，候选=%d，阈值=%d），"
+                  "本轮禁止新增纸面下注"
+                  % (FETCH_CORE_COMPLETE, FETCH_CORE_CANDIDATES,
+                     C.CORE_MIN_CANDIDATES), flush=True)
         bet_cand = bet_cand.iloc[0:0]
     cand = obs_cand
     if verbose:
@@ -801,6 +837,7 @@ def run_scan(verbose=True, dry=False, budget_sec=None):
     res = {"scanned": len(df), "obs_candidates": len(obs_cand),
            "bet_candidates": len(bet_cand), "n_cold_leagues": len(cold),
            "core_complete": FETCH_CORE_COMPLETE,
+           "core_candidates": FETCH_CORE_CANDIDATES,
            "n_obs": n_obs, "n_bets": n_bets}
     conn.close()
     return res

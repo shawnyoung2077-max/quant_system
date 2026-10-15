@@ -87,7 +87,26 @@ def health_check(conn=None, verbose=True):
     if not scans.empty:
         last_note = str(scans.iloc[0].get("note") or "")
         if last_note:
-            severity = "严重" if "core_incomplete" in last_note else "警告"
+            # ★★★ 2026-10-15 分级修正 ★★★
+            #   上一版把 note 里任何内容都判成 [警告]。问题在于
+            #   page_cap（实测每轮都有 50+ 个联赛打满页上限）和
+            #   broad_snapshot_partial 是**每轮必然出现**的，
+            #   于是简报变成每轮都报警 —— 而"告警变成噪音、人开始无视它"
+            #   正是最初那个"静默少采"能藏两天的土壤（见 2026-10-10 的记录）。
+            #
+            #   分级原则：**只有"决策样本本身不可信"才是严重。**
+            #     严重  core_incomplete / core_empty —— 下注候选的抓取本身残缺，
+            #           这一轮的"没下注 / 下注少"不能当作策略信号来读
+            #     警告  core_api_errors —— 核心抓取遇到 API 错误（可能偶发）
+            #     提示  page_cap / broad_snapshot_partial / time_budget ——
+            #           只影响"宽口径观测"的完整度，不影响下注决策，
+            #           属于已知且接受的取舍；观测缺口由第 3 节的突变检测兜底
+            if "core_incomplete" in last_note or "core_empty" in last_note:
+                severity = "严重"
+            elif "core_api_errors" in last_note:
+                severity = "警告"
+            else:
+                severity = "提示"
             issues.append("[%s] 本轮抓取存在覆盖缺口：%s" % (severity, last_note))
 
     # ---- 3. 观测数是否异常波动 ----

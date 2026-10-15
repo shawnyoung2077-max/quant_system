@@ -436,6 +436,22 @@ SETTLE_TIME_BUDGET_SEC = int(os.environ.get("POLYTRADE_SETTLE_TIME_BUDGET_SEC", 
 SETTLE_HTTP_TIMEOUT_SEC = int(os.environ.get("POLYTRADE_SETTLE_HTTP_TIMEOUT_SEC", "8"))
 
 # ---------------------------------------------------------------------------
+# ★ 核心（策略）候选的数量守卫（2026-10-15）
+# ---------------------------------------------------------------------------
+# 背景：下注候选只从「核心抓取」出（见 scan.fetch_core）。实测发现
+#   gamma 对**非法的 sports_market_types 取值不报错，只返回空列表**：
+#       sports_market_types=moneyline -> n=20（正常）
+#       sports_market_types=zzz      -> n=0   （不是错误！）
+#   而 fetch_core 把「空列表」和「正常抓到底」返回成同一个 issue=None，
+#   于是 FETCH_CORE_COMPLETE 照样为 True —— **系统会一切正常地停止下注**。
+#
+# 阈值只用于抓「整块塌掉」这种灾难，**不是覆盖率达标线**：
+#   正常一天核心候选是几百到上千个（抽查单 tag：LaLiga 63 / Bundesliga 54 /
+#   K League 1 36；Serie A 那天是 0，属正常 —— 窗口内确实没有比赛）。
+#   定得低是为了不产生假警报 —— 告警一旦变成噪音就没人看了。
+CORE_MIN_CANDIDATES = int(os.environ.get("POLYTRADE_CORE_MIN_CANDIDATES", "20"))
+
+# ---------------------------------------------------------------------------
 # ★★★ 整轮运行的墙钟预算（2026-10-14 新增）★★★
 # ---------------------------------------------------------------------------
 # 为什么 FETCH_TIME_BUDGET_SEC 不够：
@@ -531,6 +547,26 @@ BET_MAX_SPREAD = 0.06
 BET_TYPES = {
     "moneyline", "child_moneyline", "first_half_moneyline",
 }
+# ★★★ 2026-10-15：直接打真实 gamma API 测出来的三条硬约束，别"简化"掉 ★★★
+#
+# 1) 只有 `moneyline` 是真值。
+#    sports_market_types=moneyline            -> n=20  ✅
+#    sports_market_types=child_moneyline      -> n=0
+#    sports_market_types=first_half_moneyline -> n=0
+#    后两个是**字段可能出现的取值、但不是合法的过滤取值**（API 不一致）。
+#    保留在集合里无害（抓取时返回空），但要知道它们实际上不起作用；
+#    历史上有 6 笔注的 market_type 是 child_moneyline（$12），
+#    这些市场以后不会再被抓到、也就不会再下注。
+#
+# 2) `end_date_min` / `end_date_max` **单独使用会 HTTP 500**，实测：
+#        仅 end_date_min/max                -> 500
+#        end_date_min/max + sports_market_types -> 63（正常，且 63/63 在窗口内）
+#    所以 scan.fetch_core 总是把类型过滤和日期窗口一起传，这不是冗余而是必需。
+#    后人若"顺手删掉看起来多余的 sports_market_types"，核心抓取会直接 500。
+#
+# 3) 未知的参数名会被**静默忽略**（zzzparam=1 不报错、结果与不传一样）。
+#    所以参数名打错不会炸，只会悄悄不生效 —— 任何新的过滤参数都必须
+#    用真实 API 验证它真的改变了返回集，而不是"加上了就以为生效了"。
 
 # ★★★ 2026-10-12 修：下注价格预筛必须**从 BET_RULES 推导**，不能各写各的 ★★★
 #   原来预筛写死 [0.05, 0.35)，而 BET_RULES 第二条要求 mid ∈ [0.90, 0.99) ——
