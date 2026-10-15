@@ -147,7 +147,8 @@ def fetch_all_markets(verbose=True, workers=8, budget_sec=None):
                 ("end_date_min", core_date_min), ("end_date_max", core_date_max),
                 ("order", "endDate"), ("ascending", "true"),
             ] + [("sports_market_types", typ) for typ in core_types]
-            page = _get(C.GAMMA + "/markets", params, tries=1, timeout=10)
+            page = _get(C.GAMMA + "/markets", params,
+                        tries=C.FETCH_HTTP_TRIES, timeout=C.FETCH_HTTP_TIMEOUT)
             if not isinstance(page, list):
                 return out, "api"
             for m in page:
@@ -165,7 +166,8 @@ def fetch_all_markets(verbose=True, workers=8, budget_sec=None):
                 return out, "budget", False
             page = _get(C.GAMMA + "/markets",
                         {"limit": C.MARKETS_PER_TAG, "offset": pg * C.MARKETS_PER_TAG,
-                         "closed": "false", "tag_id": t}, tries=1, timeout=10)
+                         "closed": "false", "tag_id": t},
+                        tries=C.FETCH_HTTP_TRIES, timeout=C.FETCH_HTTP_TIMEOUT)
             if not isinstance(page, list):
                 return out, "api", False
             for m in page:
@@ -203,11 +205,16 @@ def fetch_all_markets(verbose=True, workers=8, budget_sec=None):
     n_core = len(seen) - n_core_before
     FETCH_CORE_CANDIDATES = n_core
     if not FETCH_CORE_COMPLETE:
-        FETCH_COVERAGE_ISSUES.append("core_incomplete tags=%d (%s)" %
-                                     (len(core_incomplete_tags), ", ".join(core_incomplete_tags[:12])))
+        # ★ 2026-10-15：带上分母。写 "tags=335" 读者不知道是普遍的还是零星的；
+        #   写 "tags=335/473" 一眼就能看出是**整块塌掉**（实测 12:05 那次
+        #   宽扫是 473/473 全失败 —— 那是链路中断，不是某几个联赛的问题）。
+        FETCH_COVERAGE_ISSUES.append("core_incomplete tags=%d/%d (%s)" %
+                                     (len(core_incomplete_tags), len(tags),
+                                      ", ".join(core_incomplete_tags[:12])))
     if core_failed_tags:
-        FETCH_COVERAGE_ISSUES.append("core_api_errors tags=%d (%s)" %
-                                     (len(core_failed_tags), ", ".join(core_failed_tags[:12])))
+        FETCH_COVERAGE_ISSUES.append("core_api_errors tags=%d/%d (%s)" %
+                                     (len(core_failed_tags), len(tags),
+                                      ", ".join(core_failed_tags[:12])))
     # ★★★ 2026-10-15 新增：核心抓取"静默变空"的守卫 ★★★
     #   实测（直接打真实 gamma API）：把一个非法的 sports_market_types 值传进去，
     #   gamma **不报错，只返回空列表**：

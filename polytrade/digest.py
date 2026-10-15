@@ -109,7 +109,28 @@ def health_check(conn=None, verbose=True):
                 severity = "提示"
             issues.append("[%s] 本轮抓取存在覆盖缺口：%s" % (severity, last_note))
 
-    # ---- 3. 观测数是否异常波动 ----
+    # ---- 3b. 单次运行的采集量异常（2026-10-15 新增）----
+    #   为什么第 3 节抓不到：observations 是按 (market_id, snap_date) 去重的，
+    #   **一天多次运行会合并成一行**。实测 2026-10-15 12:05 那一轮只采到 977 个市场
+    #   （前一轮 14,833 个，掉了 93%），但当天的按天计数仍是 ~15,000 ——
+    #   于是暴跌检测**一点动静都没有**，简报里只有一条"覆盖缺口"。
+    #   要抓单次坏轮，只能用 runs 表里**每次运行自己的** n_new_obs。
+    #   阈值 1000：低于这个量级的运行（比如 --dry 演练）不参与比较，避免假警报。
+    if not scans.empty:
+        run_obs = [int(x) for x in scans["n_new_obs"].fillna(0).tolist()]
+        cur_run = run_obs[0]
+        hist_run = [x for x in run_obs[1:6] if x >= 1000]
+        stats["obs_cur_run"] = cur_run
+        if hist_run:
+            peak_run = max(hist_run)
+            stats["obs_peak_run"] = peak_run
+            if cur_run < peak_run * 0.5:
+                issues.append("[警告] 单次运行的采集量从峰值 %d 掉到 %d（%.0f%%）—— "
+                              "多半是链路抖动或抓取被截断，**不代表市场变少了**；"
+                              "该轮观测不应当作完整快照使用"
+                              % (peak_run, cur_run, 100.0 * cur_run / peak_run))
+
+    # ---- 3. 观测数是否异常波动（按天；抓不到单次坏轮，见上面 3b）----
     obs_today = pd.read_sql_query(
         "SELECT snap_date, COUNT(DISTINCT market_id) n FROM observations "
         "GROUP BY snap_date ORDER BY snap_date DESC LIMIT 7", conn)

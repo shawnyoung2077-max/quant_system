@@ -901,5 +901,79 @@ class TestCoreCandidateGuard(unittest.TestCase):
                       "run_scan 没有用候选数量守卫拦住下注")
 
 
+class TestRunLevelCoverageAlarm(unittest.TestCase):
+    """
+    bug #13（2026-10-15）：单次坏轮在"按天统计"里完全看不见。
+    ========================================================================
+    实测：2026-10-15 12:05 那一轮只采到 977 个市场（前一轮 14,833，掉 93%），
+    但当天的按天计数仍是 ~15,000 —— 因为 observations 按
+    (market_id, snap_date) 去重，**一天多次运行会合并成一行**。
+    于是 digest 第 3 节的"观测数暴跌"检测**一点动静都没有**。
+
+    要抓单次坏轮只能用 runs 表里每次运行自己的 n_new_obs。
+    """
+
+    def test_digest_has_run_level_observation_check(self):
+        import inspect
+        from polytrade import digest as DG
+        src = inspect.getsource(DG.health_check)
+        self.assertIn("obs_cur_run", src,
+                      "digest 没有按【单次运行】的采集量做检查 —— "
+                      "单次坏轮会被按天统计掩盖")
+
+    def test_run_level_check_fires_on_a_93pct_drop(self):
+        """用真实的两次运行数据构造：前一轮 14833 -> 本轮 977，必须报警。"""
+        import sqlite3
+        import tempfile
+        from polytrade import digest as DG
+        from polytrade import db as D
+
+        fd, path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        conn = D.connect(path)
+        # 造出 runs 表需要的列
+        conn.execute("""CREATE TABLE IF NOT EXISTS runs(
+            run_id INTEGER PRIMARY KEY AUTOINCREMENT, run_ts TEXT, kind TEXT,
+            n_scanned INTEGER, n_new_obs INTEGER, n_new_bets INTEGER,
+            n_settled INTEGER, note TEXT)""")
+        for obs in (14833, 14608, 13189, 14833, 977):
+            conn.execute("INSERT INTO runs(run_ts,kind,n_new_obs,n_new_bets,note)"
+                         " VALUES(?,'scan',?,0,'')",
+                         ("2026-10-15T04:00:00+00:00", obs))
+        conn.commit()
+        try:
+            issues, stats = DG.health_check(conn=conn, verbose=False)
+        finally:
+            conn.close()
+            os.remove(path)
+        hit = [i for i in issues if "单次运行的采集量" in i]
+        self.assertTrue(hit, "977 vs 14833（跌 93%%）竟然没有触发单次运行采集量告警：%s"
+                        % issues)
+        self.assertLess(stats["obs_cur_run"], stats["obs_peak_run"])
+
+    def test_retry_settings_are_bounded_but_not_zero(self):
+        """
+        tries 不能是 1：实测 12:05 那轮遇到瞬时中断，473/473 全失败，
+        整轮丢 98% 数据。本仓库早就实测过这条链路会抖
+        （"同一变体三轮测试出现 200/ERR/ERR 混合"，正因如此才有了重试）。
+        但也不能回到 tries=5/timeout=40 —— 那会把墙钟预算吃光。
+        """
+        self.assertGreaterEqual(C.FETCH_HTTP_TRIES, 2,
+                                "tries=1 意味着一次抖动就毫无还手之力")
+        self.assertLessEqual(C.FETCH_HTTP_TRIES, 3, "重试次数过多会把预算吃光")
+        # 单请求最坏耗时必须有界
+        self.assertLessEqual(C.FETCH_HTTP_TRIES * C.FETCH_HTTP_TIMEOUT, 60,
+                             "单请求最坏耗时 %ds 太长，会撑爆抓取预算"
+                             % (C.FETCH_HTTP_TRIES * C.FETCH_HTTP_TIMEOUT))
+
+    def test_coverage_issues_include_the_denominator(self):
+        """'tags=335' 看不出是普遍还是零星；'tags=335/473' 一眼看出整块塌掉。"""
+        import inspect
+        from polytrade import scan as SC
+        src = inspect.getsource(SC.fetch_all_markets)
+        self.assertIn("core_api_errors tags=%d/%d", src,
+                      "覆盖缺口的告警没有带上分母，无法区分普遍失败与零星失败")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
